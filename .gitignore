@@ -1,0 +1,42 @@
+# Patient data and metadata
+data/
+private_data/
+clinical_data/
+splits/
+*.svs
+*.tif
+*.tiff
+*.ndpi
+*.mrxs
+*.kfb
+*.dcm
+
+# Features, weights, caches, and predictions
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.pkl
+model_weight/
+checkpoints/
+cache/
+case_tensor_cache/
+results/
+outputs/
+predictions/
+
+# Local manifests may contain identifiers or paths
+slides.csv
+train_split.csv
+test_split.csv
+pair_labels_with_case_id.csv
+*_clinical.csv
+
+# Python and editors
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store

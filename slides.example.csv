@@ -1,0 +1,3 @@
+pair_id,label,modality,path,stain_type
+example_pair_001,0,HE,/path/to/deidentified_he_slide.svs,HE
+example_pair_001,0,IHC,/path/to/deidentified_ihc_slide.tif,IHC
