@@ -9,6 +9,8 @@ from train_vgms import (
     FocalLoss,
     VGMS,
     stratified_split_cases,
+    spiral_candidate_order,
+    tile_coordinate_yx,
 )
 
 
@@ -25,6 +27,8 @@ def make_sample(feature_dim=16, n_he=11, n_ihc=7, map_size=8):
         "he_h_map": torch.rand(n_he, map_size, map_size, generator=generator),
         "ihc_h_map": torch.rand(n_ihc, map_size, map_size, generator=generator),
         "ihc_source_indices": torch.arange(n_ihc),
+        "he_candidate_tile_names": [f"{i // 4}_{i % 4}" for i in range(n_he)],
+        "ihc_anchor_tile_names": [f"{i // 4}_{i % 4}" for i in range(n_ihc)],
     }
 
 
@@ -103,9 +107,35 @@ def test_patient_disjoint_split():
     assert [len(group) for group in groups] == [10, 4, 6]
 
 
+def test_spiral_matching():
+    points = [(0, 0), (0, 1), (1, 1), (1, 0), (1, -1),
+              (0, -1), (-1, -1), (-1, 0), (-1, 1), (-1, 2)]
+    assert spiral_candidate_order(points, (0, 0)) == list(range(len(points)))
+    assert tile_coordinate_yx("250_500.png") == (250, 500)
+    sparse = [points[i] for i in [8, 0, 5, 2]]
+    assert spiral_candidate_order(sparse, (0, 0)) == [1, 3, 2, 0]
+    model = VGMS(torch.randn(6, 24), feature_dim=16, hidden_dim=12, dropout=0.0)
+    sample = make_sample(n_he=277, n_ihc=7)
+    for mode in ["both", "feature", "morph"]:
+        model.alignment_mode = mode
+        _, output = model(sample)
+        _, _, dense, _ = model._similarity(sample["he_features"], sample["ihc_features"],
+                                           sample["he_h_map"], sample["ihc_h_map"])
+        assert torch.allclose(output["s_align"], dense, atol=1e-6)
+        assert torch.equal(output["align_indices"], dense.argmax(dim=1, keepdim=True))
+    # Equal scores allow many anchors to choose candidate zero, even when
+    # candidate zero is not first in their spiral traversal.
+    sample["he_features"].zero_()
+    sample["ihc_features"].zero_()
+    model.alignment_mode = "feature"
+    _, output = model(sample)
+    assert torch.equal(output["align_indices"], torch.zeros(7, 1, dtype=torch.long))
+
+
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
+    test_spiral_matching()
     test_forward_backward()
     test_patient_disjoint_split()
     print("VGMS smoke test passed.")
