@@ -339,14 +339,24 @@ def maybe_stratify(df):
 
 
 def split_train_val(train_df, val_size, seed):
-    if val_size <= 0 or len(train_df) < 4:
+    case_labels = train_df[["case_id", "label"]].copy()
+    case_labels["case_id"] = case_labels["case_id"].astype(str)
+    inconsistent = case_labels.groupby("case_id")["label"].nunique()
+    if (inconsistent > 1).any():
+        raise ValueError("Each patient must have one response label before splitting.")
+    groups = case_labels.drop_duplicates("case_id").reset_index(drop=True)
+    if val_size <= 0 or len(groups) < 4:
         return train_df.reset_index(drop=True), train_df.iloc[0:0].copy()
-    train_sub, val_df = train_test_split(
-        train_df,
+    train_groups, val_groups = train_test_split(
+        groups,
         test_size=val_size,
         random_state=seed,
-        stratify=maybe_stratify(train_df),
+        stratify=maybe_stratify(groups),
     )
+    train_ids = set(train_groups["case_id"].astype(str))
+    val_ids = set(val_groups["case_id"].astype(str))
+    train_sub = train_df[train_df["case_id"].astype(str).isin(train_ids)].copy()
+    val_df = train_df[train_df["case_id"].astype(str).isin(val_ids)].copy()
     return train_sub.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
@@ -542,6 +552,20 @@ class GatedAttentionMIL(nn.Module):
         return logit, attn_weights, bag_feature
 
 
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha_pos=0.5, alpha_neg=0.5):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha_pos = alpha_pos
+        self.alpha_neg = alpha_neg
+
+    def forward(self, logits, targets):
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt = torch.exp(-bce)
+        alpha_t = targets * self.alpha_pos + (1.0 - targets) * self.alpha_neg
+        return (alpha_t * (1.0 - pt).pow(self.gamma) * bce).mean()
+
+
 def bootstrap_auc(labels, probs, n_bootstraps=1000, seed=42):
     labels = np.asarray(labels).astype(int)
     probs = np.asarray(probs).astype(float)
@@ -703,15 +727,17 @@ def train_one_stain(stain, train_df, val_df, test_df, external_df, args, device)
         dropout=args.dropout,
     ).to(device)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=compute_pos_weight(train_df, device)).to(device)
+    pos_ratio = float(train_df["label"].astype(int).mean())
+    criterion = BinaryFocalLoss(
+        gamma=args.focal_gamma,
+        alpha_pos=1.0 - pos_ratio,
+        alpha_neg=pos_ratio,
+    ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode="max",
-        factor=0.5,
-        patience=max(2, args.lr_patience),
-        min_lr=args.min_lr,
-        verbose=True,
+        T_max=max(args.epochs, 1),
+        eta_min=args.min_lr,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
@@ -757,7 +783,7 @@ def train_one_stain(stain, train_df, val_df, test_df, external_df, args, device)
             f"selection_acc={selection_metrics['Accuracy']:.4f}, selection_n={len(selection_df)}"
         )
 
-        scheduler.step(score)
+        scheduler.step()
         if score > best_score:
             best_score = score
             best_epoch = epoch
@@ -848,14 +874,15 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--max_patches_per_case", type=int, default=1024)
 
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--lr_patience", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--grad_clip", type=float, default=5.0)
-    parser.add_argument("--val_size", type=float, default=0.2)
+    parser.add_argument("--val_size", type=float, default=2.0 / 7.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_bootstraps", type=int, default=1000)
 

@@ -6,6 +6,8 @@ Reference implementation for:
 
 VGMS integrates paired hematoxylin and eosin (H&E) and PD-L1 immunohistochemistry (IHC) whole-slide image representations for pathological complete response prediction in non-small cell lung cancer. The repository contains the main training pipeline, single-stain baselines, module and encoder ablations, cohort visualization, result summarization, and query-attention heatmap generation.
 
+The default configuration follows the reported protocol. Each sampled IHC patch is matched to the highest-scoring H&E candidate from the same case using a fixed validation-selected mixture of hematoxylin-channel SSIM and CHIEF feature cosine similarity. Matched H&E and IHC CHIEF embeddings are concatenated with H&E hematoxylin and IHC DAB intensity features and projected. Six frozen ClinicalBERT query embeddings attend to the aligned visual tokens, and the six query-specific evidence vectors are concatenated for a three-layer gated MLP classifier.
+
 ## Repository contents
 
 | File | Purpose |
@@ -19,6 +21,9 @@ VGMS integrates paired hematoxylin and eosin (H&E) and PD-L1 immunohistochemistr
 | `plot_cohort_statistics.py` | De-identified cohort summary visualization |
 | `summary_utils.py` | Shared metric and summary-table utilities |
 | `summarize_results.py` | Aggregate completed experiment outputs |
+| `verify_paper_protocol.py` | Static check for paper-aligned implementation defaults |
+| `smoke_test.py` | CPU forward/backward, alignment-shape, and patient-split smoke test |
+| `select_alignment_lambda.py` | Validation-only grid search for the fixed alignment mixture |
 
 ## Study cohorts
 
@@ -94,24 +99,67 @@ python train_vgms.py \
   --train_split_csv ./data/patches/cohort1/train_split.csv \
   --test_split_csv ./data/patches/cohort1/test_split.csv \
   --results_dir ./results/vgms_main \
-  --val_size 0.2 \
+  --val_size 0.2857142857 \
   --epochs 200 \
   --patience 15 \
+  --loss focal \
+  --morphology_mode macenko \
+  --alignment_lambda 0.5 \
+  --max_patches_per_case 1024 \
   --device cuda:0 \
   --amp --tf32
 ```
 
 Checkpoint selection and early stopping use only the validation subset derived from the training split. Internal and external test cohorts are excluded from training, hyperparameter selection, and early stopping.
 
+### Paper protocol defaults
+
+| Setting | Value |
+|---|---:|
+| Patch size and magnification | 250 x 250 pixels at 40x |
+| Split | Patient-disjoint 5:2:3 train/validation/internal test |
+| IHC anchors sampled per image pair | At most 1,024 |
+| H&E matching candidates | All retained H&E patches from the same case |
+| Image features | Frozen CHIEF patch embeddings |
+| Stain-channel inputs | Scalar mean H&E hematoxylin and IHC DAB intensities |
+| SSIM input | Macenko hematoxylin channel resized to `32 x 32` |
+| Text encoder | Frozen Bio_ClinicalBERT checkpoint |
+| Alignment | Hard top-1 match; fixed `alignment_lambda` selected on validation AUC |
+| Optimizer | AdamW, learning rate `1e-4`, weight decay `1e-4` |
+| Schedule | Cosine decay to `1e-6`, at most 200 epochs |
+| Loss | Binary focal loss, gamma 2, training-label-derived class weights |
+| Early stopping | Validation AUC, patience 15 |
+| Decision threshold | 0.5 |
+| AUC confidence interval | 1,000 pair-level bootstrap resamples, percentile limits, seed 42 |
+
+The default `alignment_lambda=0.5` is a reproducible placeholder. Run the validation-only selection workflow below to implement the paper's grid search. Candidate runs skip both test cohorts; after selection, the script trains and evaluates one final model with the selected value.
+
+```bash
+python select_alignment_lambda.py \
+  --project_name cohort1 \
+  --external_project_name cohort2 \
+  --base_path ./data/patches \
+  --train_split_csv ./data/patches/cohort1/train_split.csv \
+  --test_split_csv ./data/patches/cohort1/test_split.csv \
+  --lambdas 0 0.25 0.5 0.75 1 \
+  --device cuda:0
+```
+
+The selected value, all validation AUCs, and the final test results are saved under `results/alignment_lambda_selection/`. The selected numerical value should also be stated in the manuscript for exact reproducibility.
+
+The implementation scores all retained H&E candidates directly. This is equivalent to the terminal state of the paper's coordinate-expansion search, which is allowed to expand to the full case-level candidate set. Many IHC anchors may select the same H&E patch.
+
 ## Ablations
 
 ```bash
-python run_module_ablation.py --base_path ./data/patches --device cuda:0
-python run_text_encoder_ablation.py --base_path ./data/patches --device cuda:0
-python run_image_encoder_ablation.py --base_path ./data/patches --device cuda:0
+python run_module_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --device cuda:0
+python run_text_encoder_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --device cuda:0
+python run_image_encoder_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --device cuda:0
 ```
 
-Use `--dry_run` to inspect generated commands before launching experiments.
+Replace `0.5` with the value selected by `select_alignment_lambda.py`. Use `--dry_run` to inspect generated commands before launching experiments.
+
+When vision-language weighting is disabled, the ablation uses a learned gated-attention MIL pooler instead of uniform averaging. This keeps the no-query comparison trainable while leaving the full VGMS query-attention path unchanged.
 
 ## Query-attention visualization
 
@@ -134,6 +182,8 @@ Do not commit a populated manifest containing real slide paths or identifiers.
 - Generated predictions retain de-identified case and slide keys for paired statistical analysis.
 - `data/`, model weights, checkpoints, caches, predictions, and WSI formats are excluded by `.gitignore`.
 - Run `python privacy_scan.py .` before every release commit.
+- Run `python verify_paper_protocol.py` to check paper-protocol defaults and core implementation markers.
+- Run `python smoke_test.py` after installing dependencies to validate model shapes, gradients, and patient-disjoint splitting.
 
 ## Citation
 
@@ -141,4 +191,4 @@ Citation information will be added after publication.
 
 ## License
 
-This private review repository is provided for evaluation only. No redistribution or reuse license is granted at this stage.
+This repository is provided for research evaluation. A formal reuse license will be added with the public release; until then, no redistribution or reuse license is granted.

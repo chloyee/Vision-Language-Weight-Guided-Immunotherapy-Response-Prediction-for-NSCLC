@@ -1,5 +1,5 @@
 """
-Soft-aligned HE-IHC query-guided MIL training.
+VGMS paper-protocol training for paired H&E and PD-L1 IHC WSIs.
 
 This script expects de-identified cohort folders where CHIEF patch features
 have already been extracted:
@@ -12,16 +12,17 @@ Each tile feature is expected to be either [2, 768] or flattened [1536]:
 
 No clinical variables are used.
 
-Model input after soft alignment:
-    [HE_i, aligned_IHC_i, hematoxylin_intensity_i, aligned_DAB_intensity_i]
+Each sampled IHC patch is matched to one H&E patch from the same case. Model
+input after fixed-lambda similarity alignment is:
+    [matched_HE_i, IHC_i, matched_HE_hematoxylin_i, IHC_DAB_i]
 
 The model saves:
     - cached case tensors with CHIEF features and stain morphology descriptors
     - query embeddings from ClinicalBERT / TF-IDF / CLIP / Qwen2.5-0.5B
     - trained checkpoints
     - WSI-level predictions and metrics
-    - per-case intermediate npz files: alignment weights, query weights,
-      MIL weights, guided weights, query modality gates, and final features.
+    - per-case intermediate npz files: alignment scores/indices, query weights,
+      query-specific evidence, and final features.
 """
 
 import argparse
@@ -266,33 +267,54 @@ def find_image_file(roots, tile_name):
     return ""
 
 
-def get_patch_roots(base_path, project_name, he_case_name, ihc_case_name):
+def get_patch_roots(base_path, project_name, he_case_name, ihc_case_name, patch_size=250):
     root = os.path.join(base_path, project_name)
     he_project = get_he_project_name(project_name)
     ihc_project = get_ihc_project_name(project_name, base_path)
     he_root = os.path.join(base_path, he_project)
     ihc_root = os.path.join(base_path, ihc_project)
-    patch_root = os.path.join(root, "patches_lv0_ps256")
-    he_patch_root = os.path.join(he_root, "patches_lv0_ps256")
-    ihc_patch_root = os.path.join(ihc_root, "patches_lv0_ps256")
+    patch_roots = [
+        os.path.join(root, f"patches_lv0_ps{patch_size}"),
+        os.path.join(root, "patches_lv0_ps256"),
+    ]
+    he_patch_roots = [
+        os.path.join(he_root, f"patches_lv0_ps{patch_size}"),
+        os.path.join(he_root, "patches_lv0_ps256"),
+    ]
+    ihc_patch_roots = [
+        os.path.join(ihc_root, f"patches_lv0_ps{patch_size}"),
+        os.path.join(ihc_root, "patches_lv0_ps256"),
+    ]
 
-    he_roots = [
-        os.path.join(he_patch_root, f"{he_project}_slides_data", he_case_name),
-        os.path.join(he_patch_root, f"{he_project}_HE_slides_data", he_case_name),
-        os.path.join(patch_root, f"{project_name}_slides_data", he_case_name),
-        os.path.join(patch_root, f"{project_name}_HE_slides_data", he_case_name),
-        os.path.join(patch_root, "matched_HE_slides_data", he_case_name),
-        os.path.join(patch_root, f"{project_name}_matched_HE_slides_data", he_case_name),
-        os.path.join(root, "matched_HE_patches", he_case_name),
-        os.path.join(root, "patch_level_HE_channels", he_case_name),
-    ]
-    ihc_roots = [
-        os.path.join(ihc_patch_root, f"{ihc_project}_slides_data", ihc_case_name),
-        os.path.join(ihc_patch_root, f"{ihc_project}_IHC_slides_data", ihc_case_name),
-        os.path.join(patch_root, f"{project_name}_slides_data", ihc_case_name),
-        os.path.join(patch_root, f"{project_name}_IHC_slides_data", ihc_case_name),
-        os.path.join(root, "patches_IHC", ihc_case_name),
-    ]
+    he_roots = []
+    for he_patch_root in he_patch_roots:
+        he_roots.extend(
+            [
+                os.path.join(he_patch_root, f"{he_project}_slides_data", he_case_name),
+                os.path.join(he_patch_root, f"{he_project}_HE_slides_data", he_case_name),
+                os.path.join(he_patch_root, f"{project_name}_slides_data", he_case_name),
+                os.path.join(he_patch_root, f"{project_name}_HE_slides_data", he_case_name),
+                os.path.join(he_patch_root, "matched_HE_slides_data", he_case_name),
+                os.path.join(he_patch_root, f"{project_name}_matched_HE_slides_data", he_case_name),
+            ]
+        )
+    he_roots.extend(
+        [
+            os.path.join(root, "matched_HE_patches", he_case_name),
+            os.path.join(root, "patch_level_HE_channels", he_case_name),
+        ]
+    )
+    ihc_roots = []
+    for ihc_patch_root in ihc_patch_roots:
+        ihc_roots.extend(
+            [
+                os.path.join(ihc_patch_root, f"{ihc_project}_slides_data", ihc_case_name),
+                os.path.join(ihc_patch_root, f"{ihc_project}_IHC_slides_data", ihc_case_name),
+                os.path.join(ihc_patch_root, f"{project_name}_slides_data", ihc_case_name),
+                os.path.join(ihc_patch_root, f"{project_name}_IHC_slides_data", ihc_case_name),
+            ]
+        )
+    ihc_roots.append(os.path.join(root, "patches_IHC", ihc_case_name))
     dab_roots = [
         os.path.join(ihc_root, "patch_level_DAB_channels", ihc_case_name),
         os.path.join(root, "patch_level_DAB_channels", ihc_case_name),
@@ -354,7 +376,29 @@ def color_deconvolution_macenko(img, stain_type="he"):
     pixels_od = img_od.reshape(-1, 3)
 
     try:
-        concentrations = pixels_od @ np.linalg.pinv(stain_vectors)
+        # Exact vectorized NNLS for a two-vector stain basis. Candidates are
+        # the feasible unconstrained solution, either one-vector boundary,
+        # and the origin; the minimum-residual candidate is selected per pixel.
+        basis = stain_vectors.T.astype(np.float32)  # [3, 2]
+        unconstrained = pixels_od @ np.linalg.pinv(stain_vectors)
+        candidate_both = np.clip(unconstrained, 0.0, None)
+
+        a0 = basis[:, 0]
+        a1 = basis[:, 1]
+        c0 = np.clip((pixels_od @ a0) / (float(a0 @ a0) + 1e-8), 0.0, None)
+        c1 = np.clip((pixels_od @ a1) / (float(a1 @ a1) + 1e-8), 0.0, None)
+        candidate_0 = np.stack([c0, np.zeros_like(c0)], axis=1)
+        candidate_1 = np.stack([np.zeros_like(c1), c1], axis=1)
+        candidate_zero = np.zeros_like(candidate_both)
+
+        candidates = np.stack(
+            [candidate_both, candidate_0, candidate_1, candidate_zero],
+            axis=1,
+        )
+        recon = candidates @ basis.T
+        residual = np.square(recon - pixels_od[:, None, :]).sum(axis=2)
+        best = np.argmin(residual, axis=1)
+        concentrations = candidates[np.arange(len(candidates)), best]
         concentrations = concentrations.reshape(img.shape[0], img.shape[1], 2)
     except np.linalg.LinAlgError:
         h, w, _ = img.shape
@@ -398,6 +442,18 @@ def zero_morph():
     return np.zeros((5,), dtype=np.float32)
 
 
+def zero_hematoxylin_map(size):
+    return np.zeros((int(size), int(size)), dtype=np.float32)
+
+
+def normalize_stain_map(stain_intensity, size):
+    arr = np.asarray(stain_intensity, dtype=np.float32)
+    if arr.max() > 1.5:
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    return cv2.resize(arr, (int(size), int(size)), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
 def load_rgb(path):
     return np.array(Image.open(path).convert("RGB"))
 
@@ -424,11 +480,11 @@ def fast_dab_proxy(image):
     return np.clip(brown, 0.0, 1.0)
 
 
-def compute_he_morphology(he_path, mode="fast_gray"):
+def compute_he_morphology(he_path, mode="macenko", map_size=32):
     if mode == "none":
-        return 0.0, zero_morph()
+        return 0.0, zero_morph(), zero_hematoxylin_map(map_size)
     if not he_path or not os.path.exists(he_path):
-        return 0.0, zero_morph()
+        return 0.0, zero_morph(), zero_hematoxylin_map(map_size)
     try:
         image = load_rgb(he_path)
         if mode == "macenko":
@@ -437,17 +493,18 @@ def compute_he_morphology(he_path, mode="fast_gray"):
         else:
             h_channel = fast_hematoxylin_proxy(image)
         h_desc = channel_descriptor(h_channel)
-        return float(h_desc[0]), h_desc
+        return float(h_desc[0]), h_desc, normalize_stain_map(h_channel, map_size)
     except Exception:
-        return 0.0, zero_morph()
+        return 0.0, zero_morph(), zero_hematoxylin_map(map_size)
 
 
-def compute_ihc_morphology(ihc_path, dab_path, mode="fast_gray"):
+def compute_ihc_morphology(ihc_path, dab_path, mode="macenko", map_size=32):
     h_desc = zero_morph()
+    h_map = zero_hematoxylin_map(map_size)
     dab_mean = 0.0
 
     if mode == "none":
-        return 0.0, 0.0, h_desc
+        return 0.0, 0.0, h_desc, h_map
 
     if ihc_path and os.path.exists(ihc_path):
         try:
@@ -461,6 +518,7 @@ def compute_ihc_morphology(ihc_path, dab_path, mode="fast_gray"):
                 h_channel = fast_hematoxylin_proxy(image)
                 dab_channel = fast_dab_proxy(image)
             h_desc = channel_descriptor(h_channel)
+            h_map = normalize_stain_map(h_channel, map_size)
             dab_mean = float(channel_descriptor(dab_channel)[0])
         except Exception:
             pass
@@ -473,7 +531,7 @@ def compute_ihc_morphology(ihc_path, dab_path, mode="fast_gray"):
         except Exception:
             pass
 
-    return float(h_desc[0]), float(dab_mean), h_desc
+    return float(h_desc[0]), float(dab_mean), h_desc, h_map
 
 
 def get_tile_feature_dir(base_path, project_name, pair_case_name):
@@ -501,16 +559,17 @@ def list_tile_feature_paths(base_path, project_name, pair_case_name):
 
 
 def get_case_cache_path(row, args, cache_dir, project_name, pair_case_name):
+    cache_tag = f"paper_v1_ps{args.patch_size}_ssim{args.ssim_map_size}_{args.morphology_mode}"
     feature_source = str(getattr(args, "feature_source", "fusion_tiles")).lower()
     if feature_source == "wsi_pt":
         encoder_name = safe_name(getattr(args, "image_encoder_name", "wsi_encoder"))
         return os.path.join(
             cache_dir,
-            f"wsi_pt_{encoder_name}",
+            f"{cache_tag}_wsi_pt_{encoder_name}",
             project_name,
             safe_name(pair_case_name) + ".pt",
         )
-    return os.path.join(cache_dir, project_name, safe_name(pair_case_name) + ".pt")
+    return os.path.join(cache_dir, cache_tag, project_name, safe_name(pair_case_name) + ".pt")
 
 
 def build_or_load_case_cache(row, args, cache_dir):
@@ -535,6 +594,7 @@ def build_or_load_case_cache(row, args, cache_dir):
         project_name,
         he_case_name,
         ihc_case_name,
+        patch_size=args.patch_size,
     )
     if "he_patches_path" in row and pd.notna(row.get("he_patches_path")):
         he_roots = [str(row.get("he_patches_path"))] + he_roots
@@ -582,6 +642,8 @@ def build_or_load_case_cache(row, args, cache_dir):
     ihc_dab_values = []
     he_morph_values = []
     ihc_morph_values = []
+    he_h_maps = []
+    ihc_h_maps = []
     he_patch_paths = []
     ihc_patch_paths = []
     dab_patch_paths = []
@@ -603,11 +665,33 @@ def build_or_load_case_cache(row, args, cache_dir):
         ihc_patch_path = find_image_file(ihc_roots, tile_name)
         dab_patch_path = find_image_file(dab_roots, tile_name)
 
-        he_h, he_morph = compute_he_morphology(he_patch_path, mode=args.morphology_mode)
-        ihc_h, ihc_dab, ihc_morph = compute_ihc_morphology(
+        needs_morphology = (
+            args.input_mode == "multistain"
+            and args.alignment_mode in {"morph", "both"}
+            and args.morphology_mode != "none"
+        )
+        if needs_morphology and not args.allow_missing_morphology:
+            missing_patch = []
+            if not he_patch_path:
+                missing_patch.append("H&E")
+            if not ihc_patch_path:
+                missing_patch.append("IHC")
+            if missing_patch:
+                raise FileNotFoundError(
+                    f"Missing {'/'.join(missing_patch)} patch image for {pair_case_name}/{tile_name}; "
+                    "SSIM alignment requires both hematoxylin images. Check --patch_size and patch roots."
+                )
+
+        he_h, he_morph, he_h_map = compute_he_morphology(
+            he_patch_path,
+            mode=args.morphology_mode,
+            map_size=args.ssim_map_size,
+        )
+        ihc_h, ihc_dab, ihc_morph, ihc_h_map = compute_ihc_morphology(
             ihc_patch_path,
             dab_patch_path,
             mode=args.morphology_mode,
+            map_size=args.ssim_map_size,
         )
 
         he_features.append(he_feature)
@@ -618,6 +702,8 @@ def build_or_load_case_cache(row, args, cache_dir):
         ihc_dab_values.append(ihc_dab)
         he_morph_values.append(he_morph)
         ihc_morph_values.append(ihc_morph)
+        he_h_maps.append(he_h_map)
+        ihc_h_maps.append(ihc_h_map)
         he_patch_paths.append(he_patch_path)
         ihc_patch_paths.append(ihc_patch_path)
         dab_patch_paths.append(dab_patch_path)
@@ -644,6 +730,8 @@ def build_or_load_case_cache(row, args, cache_dir):
         "ihc_dab": torch.tensor(ihc_dab_values, dtype=torch.float32),
         "he_morph": torch.tensor(np.stack(he_morph_values, axis=0), dtype=torch.float32),
         "ihc_morph": torch.tensor(np.stack(ihc_morph_values, axis=0), dtype=torch.float32),
+        "he_h_map": torch.tensor(np.stack(he_h_maps, axis=0), dtype=torch.float32),
+        "ihc_h_map": torch.tensor(np.stack(ihc_h_maps, axis=0), dtype=torch.float32),
         "he_patch_paths": he_patch_paths,
         "ihc_patch_paths": ihc_patch_paths,
         "dab_patch_paths": dab_patch_paths,
@@ -651,7 +739,10 @@ def build_or_load_case_cache(row, args, cache_dir):
     ensure_dir(os.path.dirname(cache_path))
     torch.save(case_obj, cache_path)
 
-    csv_path = os.path.join(cache_dir, safe_name(pair_case_name) + "_stain_morphology.csv")
+    csv_path = os.path.join(
+        os.path.dirname(cache_path),
+        safe_name(pair_case_name) + "_stain_morphology.csv",
+    )
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -895,32 +986,52 @@ def match_fixed_split(split_csv, metadata_df, results_dir, split_name):
 
 
 def stratified_split_cases(df, test_size, val_size, seed):
-    def maybe_stratify(sub_df):
-        labels = sub_df["label"].astype(int)
+    """Split patient groups, then return every image pair for the selected patients."""
+
+    case_labels = df[["case_id", "label"]].copy()
+    case_labels["case_id"] = case_labels["case_id"].astype(str)
+    inconsistent = case_labels.groupby("case_id")["label"].nunique()
+    inconsistent = inconsistent[inconsistent > 1]
+    if not inconsistent.empty:
+        raise ValueError(
+            "Each patient must have one response label. Inconsistent case_id values: "
+            + ", ".join(inconsistent.index[:10])
+        )
+    groups = case_labels.drop_duplicates("case_id").reset_index(drop=True)
+
+    def maybe_stratify(group_df):
+        labels = group_df["label"].astype(int)
         return labels if labels.nunique() == 2 and labels.value_counts().min() >= 2 else None
 
+    def select_pairs(group_df):
+        selected = set(group_df["case_id"].astype(str))
+        return df[df["case_id"].astype(str).isin(selected)].copy()
+
     if test_size <= 0:
-        train_val = df.copy()
-        test = df.iloc[0:0].copy()
+        train_val_groups = groups.copy()
+        test_groups = groups.iloc[0:0].copy()
     else:
-        train_val, test = train_test_split(
-            df,
+        train_val_groups, test_groups = train_test_split(
+            groups,
             test_size=test_size,
             random_state=seed,
-            stratify=maybe_stratify(df),
+            stratify=maybe_stratify(groups),
         )
 
-    if val_size <= 0 or len(train_val) < 4:
-        train = train_val.copy()
-        val = train_val.iloc[0:0].copy()
+    if val_size <= 0 or len(train_val_groups) < 4:
+        train_groups = train_val_groups.copy()
+        val_groups = train_val_groups.iloc[0:0].copy()
     else:
-        train, val = train_test_split(
-            train_val,
+        train_groups, val_groups = train_test_split(
+            train_val_groups,
             test_size=val_size,
             random_state=seed,
-            stratify=maybe_stratify(train_val),
+            stratify=maybe_stratify(train_val_groups),
         )
 
+    train = select_pairs(train_groups)
+    val = select_pairs(val_groups)
+    test = select_pairs(test_groups)
     return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
 
 
@@ -947,9 +1058,9 @@ class CaseMILDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
         case_obj = build_or_load_case_cache(row, self.args, self.cache_dir)
-        n = int(case_obj["he_features"].shape[0])
-        keep = self._sample_indices(n, idx)
-        keep_t = torch.tensor(keep, dtype=torch.long)
+        n_ihc = int(case_obj["ihc_features"].shape[0])
+        keep_ihc = self._sample_indices(n_ihc, idx)
+        keep_ihc_t = torch.tensor(keep_ihc, dtype=torch.long)
 
         return {
             "case_id": case_obj["case_id"],
@@ -958,16 +1069,23 @@ class CaseMILDataset(Dataset):
             "he_file": case_obj["he_file"],
             "ihc_file": case_obj["ihc_file"],
             "label": torch.tensor(float(case_obj["label"]), dtype=torch.float32),
-            "tile_names": [case_obj["tile_names"][i] for i in keep],
-            "he_patch_paths": [case_obj["he_patch_paths"][i] for i in keep],
-            "ihc_patch_paths": [case_obj["ihc_patch_paths"][i] for i in keep],
-            "he_features": case_obj["he_features"][keep_t],
-            "ihc_features": case_obj["ihc_features"][keep_t],
-            "he_h": case_obj["he_h"][keep_t],
-            "ihc_h": case_obj["ihc_h"][keep_t],
-            "ihc_dab": case_obj["ihc_dab"][keep_t],
-            "he_morph": case_obj["he_morph"][keep_t],
-            "ihc_morph": case_obj["ihc_morph"][keep_t],
+            "tile_names": [case_obj["tile_names"][i] for i in keep_ihc],
+            "ihc_anchor_tile_names": [case_obj["tile_names"][i] for i in keep_ihc],
+            "he_candidate_tile_names": list(case_obj["tile_names"]),
+            "he_patch_paths": list(case_obj["he_patch_paths"]),
+            "ihc_patch_paths": [case_obj["ihc_patch_paths"][i] for i in keep_ihc],
+            # The paper samples at most 1,024 IHC anchors while retaining all
+            # H&E patches from the case as matching candidates.
+            "he_features": case_obj["he_features"],
+            "ihc_features": case_obj["ihc_features"][keep_ihc_t],
+            "he_h": case_obj["he_h"],
+            "ihc_h": case_obj["ihc_h"][keep_ihc_t],
+            "ihc_dab": case_obj["ihc_dab"][keep_ihc_t],
+            "he_morph": case_obj["he_morph"],
+            "ihc_morph": case_obj["ihc_morph"][keep_ihc_t],
+            "he_h_map": case_obj["he_h_map"],
+            "ihc_h_map": case_obj["ihc_h_map"][keep_ihc_t],
+            "ihc_source_indices": keep_ihc_t,
         }
 
 
@@ -991,6 +1109,9 @@ def to_device(sample, device):
         "ihc_dab",
         "he_morph",
         "ihc_morph",
+        "he_h_map",
+        "ihc_h_map",
+        "ihc_source_indices",
     ]:
         out[key] = out[key].to(device)
     return out
@@ -1267,23 +1388,27 @@ def make_mlp(in_dim, hidden_dim, out_dim, dropout):
     )
 
 
-def init_query_modality_logits():
-    # Columns: HE feature branch, IHC feature branch, scalar H/DAB branch.
-    priors = np.array(
-        [
-            [0.65, 0.25, 0.10],  # tumor-rich viable tumor
-            [0.10, 0.45, 0.45],  # strong membranous PD-L1 DAB
-            [0.75, 0.15, 0.10],  # TILs
-            [0.65, 0.25, 0.10],  # tumor-stroma interface
-            [0.45, 0.45, 0.10],  # immune cold
-            [0.70, 0.20, 0.10],  # TLS-like aggregates
-        ],
-        dtype=np.float32,
-    )
-    return torch.log(torch.from_numpy(priors))
+class ThreeLayerGatedMLP(nn.Module):
+    """Three-layer gated classifier used after concatenating query evidence."""
+
+    def __init__(self, in_dim, hidden_dim, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim * 2)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.norm(x)
+        value, gate = self.fc1(x).chunk(2, dim=-1)
+        x = F.gelu(value) * torch.sigmoid(gate)
+        x = self.dropout(x)
+        x = self.dropout(F.gelu(self.fc2(x)))
+        return self.fc3(x)
 
 
-class SoftAlignQueryGuidedMIL(nn.Module):
+class VGMS(nn.Module):
     def __init__(
         self,
         query_embeddings,
@@ -1297,10 +1422,10 @@ class SoftAlignQueryGuidedMIL(nn.Module):
         disable_morph_alignment=False,
         disable_query_guidance=False,
         disable_query_branch=False,
-        disable_soft_alignment=False,
-        use_query_modality_prior=True,
+        disable_alignment=False,
         input_mode="multistain",
         alignment_mode="both",
+        alignment_lambda=0.5,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -1310,10 +1435,13 @@ class SoftAlignQueryGuidedMIL(nn.Module):
         self.disable_morph_alignment = bool(disable_morph_alignment)
         self.disable_query_guidance = bool(disable_query_guidance)
         self.disable_query_branch = bool(disable_query_branch)
-        self.disable_soft_alignment = bool(disable_soft_alignment)
+        self.disable_alignment = bool(disable_alignment)
         self.input_mode = str(input_mode).lower()
         self.alignment_mode = str(alignment_mode).lower()
-        if self.disable_soft_alignment:
+        self.alignment_lambda = float(alignment_lambda)
+        if not 0.0 <= self.alignment_lambda <= 1.0:
+            raise ValueError("alignment_lambda must be in [0, 1]")
+        if self.disable_alignment:
             self.alignment_mode = "none"
         if self.disable_morph_alignment and self.alignment_mode == "both":
             self.alignment_mode = "feature"
@@ -1325,114 +1453,84 @@ class SoftAlignQueryGuidedMIL(nn.Module):
         num_queries = int(query_embeddings.shape[0])
         self.num_queries = num_queries
 
-        self.he_align_proj = make_mlp(feature_dim, hidden_dim, align_dim, dropout)
-        self.ihc_align_proj = make_mlp(feature_dim, hidden_dim, align_dim, dropout)
-        self.he_morph_proj = make_mlp(morph_dim, hidden_dim // 2, align_dim, dropout)
-        self.ihc_morph_proj = make_mlp(morph_dim, hidden_dim // 2, align_dim, dropout)
-        self.align_mix_logits = nn.Parameter(torch.zeros(2))
-        self.log_temperature = nn.Parameter(torch.log(torch.tensor(self.temperature)))
-
-        self.he_token_proj = make_mlp(feature_dim, hidden_dim, hidden_dim, dropout)
-        self.ihc_token_proj = make_mlp(feature_dim, hidden_dim, hidden_dim, dropout)
-        self.scalar_token_proj = make_mlp(2, hidden_dim // 2, hidden_dim, dropout)
-        self.pair_fuse = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
+        # Equation (5): concatenate matched H&E, IHC, H intensity, and DAB
+        # intensity before projection into the visual-token space.
+        self.visual_proj = make_mlp(feature_dim * 2 + 2, hidden_dim, hidden_dim, dropout)
         self.query_proj = make_mlp(query_dim, hidden_dim, hidden_dim, dropout)
-        if use_query_modality_prior:
-            q_logits = init_query_modality_logits()
-        else:
-            q_logits = torch.zeros(num_queries, 3)
-        self.query_modality_logits = nn.Parameter(q_logits.float())
-        self.query_importance_logits = nn.Parameter(torch.zeros(num_queries))
+        self.query_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.visual_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        # Used only by the no-query ablation. The full VGMS path below remains
+        # the six-query cross-attention described in the paper.
+        self.mil_attention_v = nn.Linear(hidden_dim, hidden_dim)
+        self.mil_attention_u = nn.Linear(hidden_dim, hidden_dim)
+        self.mil_attention_w = nn.Linear(hidden_dim, 1, bias=False)
+        self.classifier = ThreeLayerGatedMLP(hidden_dim * num_queries, hidden_dim * 2, dropout)
 
-        self.mil_attention = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
+    @staticmethod
+    def _pairwise_ssim(ihc_h_map, he_h_map):
+        """Global standard-form SSIM for every IHC-H&E hematoxylin pair."""
+        x = ihc_h_map.flatten(1).float()
+        y = he_h_map.flatten(1).float()
+        x_mean = x.mean(dim=1, keepdim=True)
+        y_mean = y.mean(dim=1, keepdim=True)
+        x_centered = x - x_mean
+        y_centered = y - y_mean
+        denom = max(int(x.shape[1]) - 1, 1)
+        covariance = (x_centered @ y_centered.t()) / denom
+        x_var = (x_centered.square().sum(dim=1, keepdim=True) / denom)
+        y_var = (y_centered.square().sum(dim=1, keepdim=True) / denom).t()
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        luminance = (2.0 * (x_mean @ y_mean.t()) + c1) / (
+            x_mean.square() + y_mean.t().square() + c1
         )
-        self.guidance_gamma = nn.Parameter(torch.tensor(0.5))
+        contrast_structure = (2.0 * covariance + c2) / (x_var + y_var + c2)
+        return luminance * contrast_structure
 
-        final_dim = hidden_dim * (3 + num_queries)
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(final_dim),
-            nn.Linear(final_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def _similarity(self, he_features, ihc_features, he_morph, ihc_morph):
-        he_z = F.normalize(self.he_align_proj(he_features), dim=1)
-        ihc_z = F.normalize(self.ihc_align_proj(ihc_features), dim=1)
-        s_feat = he_z @ ihc_z.t()
+    def _similarity(self, he_features, ihc_features, he_h_map, ihc_h_map):
+        # Rows are IHC anchors; columns are all H&E candidates from the case.
+        s_feat = F.normalize(ihc_features, dim=1) @ F.normalize(he_features, dim=1).t()
 
         if self.alignment_mode == "feature":
             s_morph = torch.zeros_like(s_feat)
             mix_weights = torch.tensor([1.0, 0.0], device=he_features.device)
             return s_feat, s_morph, s_feat, mix_weights
 
-        he_m = F.normalize(self.he_morph_proj(he_morph), dim=1)
-        ihc_m = F.normalize(self.ihc_morph_proj(ihc_morph), dim=1)
-        s_morph = he_m @ ihc_m.t()
+        s_morph = self._pairwise_ssim(ihc_h_map, he_h_map)
 
         if self.alignment_mode == "morph":
             mix_weights = torch.tensor([0.0, 1.0], device=he_features.device)
             return s_feat, s_morph, s_morph, mix_weights
 
-        mix_weights = torch.softmax(self.align_mix_logits, dim=0)
+        mix_weights = torch.tensor(
+            [1.0 - self.alignment_lambda, self.alignment_lambda],
+            dtype=he_features.dtype,
+            device=he_features.device,
+        )
         s_align = mix_weights[0] * s_feat + mix_weights[1] * s_morph
         return s_feat, s_morph, s_align, mix_weights
 
-    def _soft_align(self, he_features, ihc_features, he_morph, ihc_morph, ihc_dab):
+    def _align(self, he_features, ihc_features, he_h_map, ihc_h_map, source_indices):
         n_he = int(he_features.shape[0])
         n_ihc = int(ihc_features.shape[0])
 
-        if self.disable_soft_alignment or self.alignment_mode == "none":
-            n = min(n_he, n_ihc)
-            aligned = ihc_features[:n_he]
-            if n_he > n_ihc:
-                pad = ihc_features[-1:].repeat(n_he - n_ihc, 1)
-                aligned = torch.cat([ihc_features, pad], dim=0)
-            aligned_dab = ihc_dab[:n_he]
-            if n_he > n_ihc:
-                pad_dab = ihc_dab[-1:].repeat(n_he - n_ihc)
-                aligned_dab = torch.cat([ihc_dab, pad_dab], dim=0)
-            idx = torch.arange(n_he, device=he_features.device).clamp(max=max(n_ihc - 1, 0)).unsqueeze(1)
-            weight = torch.ones(n_he, 1, device=he_features.device)
+        if self.disable_alignment or self.alignment_mode == "none":
+            idx = source_indices.long().clamp(max=max(n_he - 1, 0)).reshape(-1, 1)
+            aligned = he_features[idx[:, 0]]
+            weight = torch.ones(n_ihc, 1, device=he_features.device)
             mix_weights = torch.tensor([1.0, 0.0], device=he_features.device)
-            return aligned, aligned_dab, idx, weight, None, None, None, mix_weights
+            return aligned, idx, weight, None, None, None, mix_weights
 
         s_feat, s_morph, s_align, mix_weights = self._similarity(
             he_features,
             ihc_features,
-            he_morph,
-            ihc_morph,
+            he_h_map,
+            ihc_h_map,
         )
-        tau = torch.clamp(torch.exp(self.log_temperature), min=0.02, max=1.0)
-
-        if self.align_topk > 0 and self.align_topk < n_ihc:
-            values, indices = torch.topk(s_align, k=self.align_topk, dim=1)
-            weights = torch.softmax(values / tau, dim=1)
-            ihc_top = ihc_features[indices]
-            dab_top = ihc_dab[indices]
-            aligned = torch.sum(weights.unsqueeze(-1) * ihc_top, dim=1)
-            aligned_dab = torch.sum(weights * dab_top, dim=1)
-        else:
-            indices = torch.arange(n_ihc, device=he_features.device).unsqueeze(0).repeat(n_he, 1)
-            weights = torch.softmax(s_align / tau, dim=1)
-            aligned = weights @ ihc_features
-            aligned_dab = weights @ ihc_dab
-
-        return aligned, aligned_dab, indices, weights, s_feat, s_morph, s_align, mix_weights
+        indices = torch.argmax(s_align, dim=1, keepdim=True)
+        weights = torch.ones(n_ihc, 1, device=he_features.device)
+        aligned = he_features[indices[:, 0]]
+        return aligned, indices, weights, s_feat, s_morph, s_align, mix_weights
 
     def forward(self, sample):
         he_features = sample["he_features"]
@@ -1440,108 +1538,87 @@ class SoftAlignQueryGuidedMIL(nn.Module):
         he_h = sample["he_h"].float().clamp(0.0, 1.0)
         ihc_h = sample["ihc_h"].float().clamp(0.0, 1.0)
         ihc_dab = sample["ihc_dab"].float().clamp(0.0, 1.0)
-        he_morph = sample["he_morph"].float()
-        ihc_morph = sample["ihc_morph"].float()
+        he_h_map = sample["he_h_map"].float().clamp(0.0, 1.0)
+        ihc_h_map = sample["ihc_h_map"].float().clamp(0.0, 1.0)
+        source_indices = sample["ihc_source_indices"]
 
         zero_align = torch.tensor([0.0, 0.0], device=he_features.device)
         if self.input_mode == "he":
             n = int(he_features.shape[0])
-            anchor_features = he_features
-            aligned_ihc = torch.zeros_like(he_features)
-            aligned_dab = torch.zeros(n, device=he_features.device)
+            matched_he = he_features
+            visual_ihc = torch.zeros_like(he_features)
+            matched_he_h = he_h
+            visual_dab = torch.zeros(n, device=he_features.device)
             align_idx = torch.zeros(n, 1, dtype=torch.long, device=he_features.device)
             align_weights = torch.ones(n, 1, device=he_features.device)
             s_feat = s_morph = s_align = None
             align_mix = zero_align
-            scalar_features = torch.stack([he_h, aligned_dab], dim=1)
-            he_token = self.he_token_proj(anchor_features)
-            ihc_token = torch.zeros(n, self.hidden_dim, device=he_features.device)
         elif self.input_mode == "ihc":
             n = int(ihc_features.shape[0])
-            anchor_features = ihc_features
-            aligned_ihc = ihc_features
-            aligned_dab = ihc_dab
+            matched_he = torch.zeros_like(ihc_features)
+            visual_ihc = ihc_features
+            matched_he_h = ihc_h
+            visual_dab = ihc_dab
             align_idx = torch.arange(n, device=ihc_features.device).unsqueeze(1)
             align_weights = torch.ones(n, 1, device=ihc_features.device)
             s_feat = s_morph = s_align = None
             align_mix = zero_align
-            scalar_features = torch.stack([ihc_h, ihc_dab], dim=1)
-            he_token = torch.zeros(n, self.hidden_dim, device=ihc_features.device)
-            ihc_token = self.ihc_token_proj(anchor_features)
         else:
-            aligned_ihc, aligned_dab, align_idx, align_weights, s_feat, s_morph, s_align, align_mix = self._soft_align(
+            matched_he, align_idx, align_weights, s_feat, s_morph, s_align, align_mix = self._align(
                 he_features,
                 ihc_features,
-                he_morph,
-                ihc_morph,
-                ihc_dab,
+                he_h_map,
+                ihc_h_map,
+                source_indices,
             )
-            scalar_features = torch.stack([he_h, aligned_dab.clamp(0.0, 1.0)], dim=1)
-            he_token = self.he_token_proj(he_features)
-            ihc_token = self.ihc_token_proj(aligned_ihc)
-        scalar_token = self.scalar_token_proj(scalar_features)
+            matched_he_h = he_h[align_idx[:, 0]]
+            visual_ihc = ihc_features
+            visual_dab = ihc_dab
 
-        pair_tokens = self.pair_fuse(torch.cat([he_token, ihc_token, scalar_token], dim=1))
+        visual_input = torch.cat(
+            [matched_he, visual_ihc, matched_he_h.unsqueeze(1), visual_dab.unsqueeze(1)],
+            dim=1,
+        )
+        pair_tokens = self.visual_proj(visual_input)
 
-        query_tokens = self.query_proj(self.query_embeddings)
-        query_tokens = F.normalize(query_tokens, dim=1)
-        he_score = query_tokens @ F.normalize(he_token, dim=1).t()
-        ihc_score = query_tokens @ F.normalize(ihc_token, dim=1).t()
-        scalar_score = query_tokens @ F.normalize(scalar_token, dim=1).t()
-        component_scores = torch.stack([he_score, ihc_score, scalar_score], dim=1)
+        query_tokens = self.query_q(self.query_proj(self.query_embeddings))
+        visual_keys = self.visual_k(pair_tokens)
+        query_scores = (query_tokens @ visual_keys.t()) / math.sqrt(self.hidden_dim)
 
-        modality_gates = torch.softmax(self.query_modality_logits, dim=1)
-        query_scores = torch.sum(component_scores * modality_gates.unsqueeze(-1), dim=1)
-        query_scores = query_scores / math.sqrt(self.hidden_dim)
+        mil_scores = self.mil_attention_w(
+            torch.tanh(self.mil_attention_v(pair_tokens))
+            * torch.sigmoid(self.mil_attention_u(pair_tokens))
+        ).squeeze(1)
+        mil_weights = torch.softmax(mil_scores, dim=0)
 
-        if self.disable_query_branch:
-            query_weights = torch.full_like(query_scores, 1.0 / max(query_scores.shape[1], 1))
-            query_evidence = torch.zeros(self.num_queries, self.hidden_dim, device=pair_tokens.device)
+        if self.disable_query_branch or self.disable_query_guidance:
+            # A fair no-query baseline still learns which instances matter.
+            # Repetition preserves the classifier input size and parameter count.
+            query_weights = mil_weights.unsqueeze(0).expand(self.num_queries, -1)
         else:
             query_weights = torch.softmax(query_scores, dim=1)
-            query_evidence = query_weights @ pair_tokens
-
-        query_importance = torch.softmax(self.query_importance_logits, dim=0)
-        query_prior = torch.sum(query_importance.unsqueeze(1) * query_weights, dim=0)
-
-        mil_logits = self.mil_attention(pair_tokens).squeeze(1)
-        mil_weights = torch.softmax(mil_logits, dim=0)
-
-        if self.disable_query_guidance or self.disable_query_branch:
-            guided_weights = mil_weights
-        else:
-            gamma = F.softplus(self.guidance_gamma)
-            guided_logits = mil_logits + gamma * torch.log(query_prior + 1e-8)
-            guided_weights = torch.softmax(guided_logits, dim=0)
-
-        mil_feature = torch.sum(mil_weights.unsqueeze(1) * pair_tokens, dim=0)
-        guided_feature = torch.sum(guided_weights.unsqueeze(1) * pair_tokens, dim=0)
-        query_feature = torch.sum(query_importance.unsqueeze(1) * query_evidence, dim=0)
-        final_feature = torch.cat(
-            [
-                mil_feature,
-                guided_feature,
-                query_feature,
-                query_evidence.reshape(-1),
-            ],
-            dim=0,
-        )
+        query_evidence = query_weights @ pair_tokens
+        final_feature = query_evidence.reshape(-1)
         logit = self.classifier(final_feature.unsqueeze(0)).squeeze(0).squeeze(0)
 
+        query_importance = torch.full(
+            (self.num_queries,),
+            1.0 / self.num_queries,
+            device=pair_tokens.device,
+        )
         outputs = {
             "logit": logit,
             "prob": torch.sigmoid(logit.detach()),
             "pair_tokens": pair_tokens,
             "final_feature": final_feature,
             "mil_weights": mil_weights,
-            "guided_weights": guided_weights,
+            "guided_weights": query_weights.mean(dim=0),
             "query_weights": query_weights,
             "query_scores": query_scores,
-            "query_component_scores": component_scores,
+            "query_component_scores": query_scores.unsqueeze(1),
             "query_evidence": query_evidence,
             "query_importance": query_importance,
-            "query_modality_gates": modality_gates,
-            "aligned_dab": aligned_dab,
+            "aligned_dab": visual_dab,
             "align_indices": align_idx,
             "align_weights": align_weights,
             "align_mix_weights": align_mix,
@@ -1553,15 +1630,17 @@ class SoftAlignQueryGuidedMIL(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.5):
+    def __init__(self, gamma=2.0, alpha_pos=0.5, alpha_neg=0.5):
         super().__init__()
         self.gamma = gamma
-        self.alpha = alpha
+        self.alpha_pos = alpha_pos
+        self.alpha_neg = alpha_neg
 
     def forward(self, logits, targets):
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         pt = torch.exp(-bce)
-        loss = self.alpha * (1.0 - pt) ** self.gamma * bce
+        alpha_t = targets * self.alpha_pos + (1.0 - targets) * self.alpha_neg
+        loss = alpha_t * (1.0 - pt) ** self.gamma * bce
         return loss.mean()
 
 
@@ -1683,6 +1762,8 @@ def save_case_intermediate(out_dir, split_name, sample, outputs):
         "label": detach_np(sample["label"]),
         "prob": detach_np(outputs["prob"]),
         "tile_names": np.asarray(sample["tile_names"]),
+        "ihc_anchor_tile_names": np.asarray(sample["ihc_anchor_tile_names"]),
+        "he_candidate_tile_names": np.asarray(sample["he_candidate_tile_names"]),
         "he_patch_paths": np.asarray(sample["he_patch_paths"]),
         "ihc_patch_paths": np.asarray(sample["ihc_patch_paths"]),
         "he_h": detach_np(sample["he_h"]),
@@ -1696,10 +1777,12 @@ def save_case_intermediate(out_dir, split_name, sample, outputs):
         "query_component_scores": detach_np(outputs["query_component_scores"]),
         "query_evidence": detach_np(outputs["query_evidence"]),
         "query_importance": detach_np(outputs["query_importance"]),
-        "query_modality_gates": detach_np(outputs["query_modality_gates"]),
         "align_indices": detach_np(outputs["align_indices"]),
         "align_weights": detach_np(outputs["align_weights"]),
         "align_mix_weights": detach_np(outputs["align_mix_weights"]),
+        "s_feat": detach_np(outputs["s_feat"]),
+        "s_morph": detach_np(outputs["s_morph"]),
+        "s_align": detach_np(outputs["s_align"]),
         "final_feature": detach_np(outputs["final_feature"]),
     }
     np.savez_compressed(path, **data)
@@ -1994,6 +2077,21 @@ def build_dataframes(args):
             print("[DONE] --cache_only was set, stop after cache prebuild.")
             raise SystemExit(0)
 
+    split_case_ids = {
+        "train": set(train_df["case_id"].astype(str)),
+        "val": set(val_df["case_id"].astype(str)),
+        "internal_test": set(test_df["case_id"].astype(str)),
+    }
+    split_names = list(split_case_ids)
+    for i, left_name in enumerate(split_names):
+        for right_name in split_names[i + 1:]:
+            overlap = split_case_ids[left_name] & split_case_ids[right_name]
+            if overlap:
+                raise ValueError(
+                    f"Patient leakage between {left_name} and {right_name}: "
+                    + ", ".join(sorted(overlap)[:10])
+                )
+
     save_split_csv(train_df, os.path.join(split_dir, "train_cases.csv"))
     save_split_csv(val_df, os.path.join(split_dir, "val_cases.csv"))
     save_split_csv(test_df, os.path.join(split_dir, "internal_test_cases.csv"))
@@ -2027,8 +2125,13 @@ def make_criterion(args, train_df, device):
     if args.loss == "focal":
         labels = train_df["label"].astype(int).values
         pos_ratio = float(labels.mean()) if len(labels) else 0.5
-        alpha = 1.0 - pos_ratio if 0.0 < pos_ratio < 1.0 else 0.5
-        return FocalLoss(gamma=args.focal_gamma, alpha=alpha).to(device)
+        alpha_pos = 1.0 - pos_ratio if 0.0 < pos_ratio < 1.0 else 0.5
+        alpha_neg = pos_ratio if 0.0 < pos_ratio < 1.0 else 0.5
+        return FocalLoss(
+            gamma=args.focal_gamma,
+            alpha_pos=alpha_pos,
+            alpha_neg=alpha_neg,
+        ).to(device)
     return nn.BCEWithLogitsLoss(pos_weight=compute_pos_weight(train_df, device)).to(device)
 
 
@@ -2070,7 +2173,7 @@ def train(args):
         os.path.join(args.results_dir, "query_embedding_metadata.json"),
     )
 
-    model = SoftAlignQueryGuidedMIL(
+    model = VGMS(
         query_embeddings=query_embeddings,
         feature_dim=args.feature_dim,
         morph_dim=5,
@@ -2082,10 +2185,10 @@ def train(args):
         disable_morph_alignment=args.disable_morph_alignment,
         disable_query_guidance=args.disable_query_guidance,
         disable_query_branch=args.disable_query_branch,
-        disable_soft_alignment=args.disable_soft_alignment,
-        use_query_modality_prior=not args.no_query_modality_prior,
+        disable_alignment=args.disable_alignment,
         input_mode=args.input_mode,
         alignment_mode=args.alignment_mode,
+        alignment_lambda=args.alignment_lambda,
     ).to(device)
 
     criterion = make_criterion(args, train_df, device)
@@ -2181,10 +2284,10 @@ def train(args):
     evaluate(model, train_loader, device, args, "train_best", save_intermediates=args.save_train_intermediates)
     if len(val_df) > 0:
         evaluate(model, val_loader, device, args, "val_best", save_intermediates=True)
-    if len(test_df) > 0:
+    if not args.skip_test_evaluation and len(test_df) > 0:
         evaluate(model, test_loader, device, args, "internal_test_best", save_intermediates=True)
 
-    if external_loader is not None and len(external_df) > 0:
+    if not args.skip_test_evaluation and external_loader is not None and len(external_df) > 0:
         evaluate(
             model,
             external_loader,
@@ -2194,23 +2297,24 @@ def train(args):
             save_intermediates=True,
         )
 
-    write_single_experiment_summary(
-        args.results_dir,
-        experiment_name=os.path.basename(os.path.abspath(args.results_dir)) or "main_experiment",
-        prefix="summary",
-    )
+    if not args.skip_test_evaluation:
+        write_single_experiment_summary(
+            args.results_dir,
+            experiment_name=os.path.basename(os.path.abspath(args.results_dir)) or "main_experiment",
+            prefix="summary",
+        )
 
     print(f"[DONE] Results saved to: {args.results_dir}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train soft-aligned HE-IHC query-guided MIL without clinical variables."
+        description="Train hard-aligned H&E-IHC VGMS without clinical variables."
     )
     parser.add_argument("--project_name", type=str, default="cohort1")
     parser.add_argument("--external_project_name", type=str, default="cohort2")
     parser.add_argument("--base_path", type=str, default="../data/patches")
-    parser.add_argument("--results_dir", type=str, default="./soft_align_query_guided_mil_results")
+    parser.add_argument("--results_dir", type=str, default="./results/vgms_main")
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -2281,9 +2385,17 @@ def parse_args():
         choices=["none", "feature", "morph", "both"],
         help="Multi-stain alignment ablation: no alignment, feature-only, morphology-only, or learnable combination.",
     )
-    parser.add_argument("--align_topk", type=int, default=64)
+    parser.add_argument("--align_topk", type=int, default=1, help="Compatibility option; paper protocol uses hard top-1 matching.")
     parser.add_argument("--align_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--alignment_lambda",
+        type=float,
+        default=0.5,
+        help="Fixed morphology weight lambda; feature weight is 1-lambda. Select on validation data only.",
+    )
     parser.add_argument("--max_patches_per_case", type=int, default=1024)
+    parser.add_argument("--patch_size", type=int, default=250)
+    parser.add_argument("--ssim_map_size", type=int, default=32)
 
     parser.add_argument(
         "--text_encoder_type",
@@ -2323,26 +2435,31 @@ def parse_args():
     parser.add_argument(
         "--morphology_mode",
         type=str,
-        default="fast_gray",
+        default="macenko",
         choices=["fast_gray", "macenko", "none"],
         help="fast_gray is much faster; macenko matches the stain-separation idea but is CPU-heavy.",
     )
 
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal"])
+    parser.add_argument("--loss", type=str, default="focal", choices=["bce", "focal"])
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--grad_clip", type=float, default=5.0)
 
-    parser.add_argument("--query_diversity_lambda", type=float, default=0.01)
+    parser.add_argument("--query_diversity_lambda", type=float, default=0.0)
     parser.add_argument("--query_entropy_lambda", type=float, default=0.0)
     parser.add_argument("--mil_entropy_lambda", type=float, default=0.0)
 
     parser.add_argument("--test_size", type=float, default=0.3)
-    parser.add_argument("--val_size", type=float, default=0.2)
+    parser.add_argument(
+        "--val_size",
+        type=float,
+        default=2.0 / 7.0,
+        help="Validation fraction within the 70% development pool; 2/7 yields the paper's 5:2:3 split.",
+    )
     parser.add_argument("--train_on_all", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_bootstraps", type=int, default=1000)
@@ -2378,8 +2495,18 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--force_rebuild_cache", action="store_true")
+    parser.add_argument(
+        "--allow_missing_morphology",
+        action="store_true",
+        help="Allow missing patch images by substituting zero morphology maps; not paper-faithful.",
+    )
     parser.add_argument("--prebuild_cache", action="store_true")
     parser.add_argument("--cache_only", action="store_true")
+    parser.add_argument(
+        "--skip_test_evaluation",
+        action="store_true",
+        help="Train/select on train-validation data without evaluating internal or external tests.",
+    )
     parser.set_defaults(save_train_intermediates=True)
     parser.add_argument(
         "--save_train_intermediates",
@@ -2398,8 +2525,7 @@ def parse_args():
     parser.add_argument("--disable_morph_alignment", action="store_true")
     parser.add_argument("--disable_query_guidance", action="store_true")
     parser.add_argument("--disable_query_branch", action="store_true")
-    parser.add_argument("--disable_soft_alignment", action="store_true")
-    parser.add_argument("--no_query_modality_prior", action="store_true")
+    parser.add_argument("--disable_alignment", action="store_true")
 
     return parser.parse_args()
 

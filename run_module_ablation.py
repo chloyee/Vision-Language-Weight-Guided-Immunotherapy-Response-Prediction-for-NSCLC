@@ -33,10 +33,11 @@ def parse_args():
     parser.add_argument("--output_root", default="./results/module_ablation")
     parser.add_argument("--cache_dir", default="./results/cache")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--val_size", type=float, default=0.2)
-    parser.add_argument("--max_patches_per_case", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--val_size", type=float, default=2.0 / 7.0)
+    parser.add_argument("--alignment_lambda", type=float, default=0.5)
+    parser.add_argument("--max_patches_per_case", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--include_full", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
@@ -57,6 +58,7 @@ def build_command(args, experiment):
         "--epochs", str(args.epochs),
         "--patience", str(args.patience),
         "--val_size", str(args.val_size),
+        "--alignment_lambda", str(args.alignment_lambda),
         "--max_patches_per_case", str(args.max_patches_per_case),
         "--num_workers", str(args.num_workers),
         "--input_mode", input_mode,

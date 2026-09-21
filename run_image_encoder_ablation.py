@@ -18,9 +18,12 @@ def parse_args():
     parser.add_argument("--cache_root", default="./results/image_encoder_cache")
     parser.add_argument("--encoders", nargs="*", default=["Virchow2", "UNI-2h", "CHIEF", "TITAN"])
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--val_size", type=float, default=0.2)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--val_size", type=float, default=2.0 / 7.0)
+    parser.add_argument("--alignment_lambda", type=float, default=0.5)
+    parser.add_argument("--max_patches_per_case", type=int, default=1024)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
 
@@ -43,6 +46,9 @@ def main():
             "--epochs", str(args.epochs),
             "--patience", str(args.patience),
             "--val_size", str(args.val_size),
+            "--alignment_lambda", str(args.alignment_lambda),
+            "--max_patches_per_case", str(args.max_patches_per_case),
+            "--num_workers", str(args.num_workers),
             "--input_mode", "multistain",
             "--alignment_mode", "both",
             "--prob_postprocess", "none",

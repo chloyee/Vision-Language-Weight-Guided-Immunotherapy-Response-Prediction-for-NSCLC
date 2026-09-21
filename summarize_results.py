@@ -9,7 +9,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Summarize internal/external WSI metrics into paper-copy CSV files."
     )
-    parser.add_argument("--ablation_root", type=str, default="./soft_align_ablation_fast_results")
+    parser.add_argument("--ablation_root", type=str, default="./results/module_ablation")
     parser.add_argument("--prefix", type=str, default="abtest_summary")
     parser.add_argument(
         "--only",
