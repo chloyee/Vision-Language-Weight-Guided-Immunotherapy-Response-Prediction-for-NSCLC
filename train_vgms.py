@@ -1858,7 +1858,7 @@ def sigmoid_float(logit_value):
 def postprocess_probability_from_logit(logit_value, args):
     logit_value = float(logit_value)
     raw_prob = sigmoid_float(logit_value)
-    mode = str(getattr(args, "prob_postprocess", "none")).lower()
+    mode = str(getattr(args, "prob_postprocess", "temperature")).lower()
 
     if mode == "temperature":
         temperature = max(float(getattr(args, "prob_temperature", 4.0)), 1e-6)
@@ -1953,7 +1953,7 @@ def save_predictions_and_metrics(results_dir, split_name, rows, args):
         pred_df["true_label"] = pred_df["label"]
 
     should_postprocess = (
-        str(getattr(args, "prob_postprocess", "none")).lower() != "none"
+        str(getattr(args, "prob_postprocess", "temperature")).lower() != "none"
         and not str(split_name).endswith("_epoch_tmp")
     )
     if should_postprocess and "_raw_logit_for_storage" in pred_df.columns:
@@ -2649,9 +2649,9 @@ def parse_args():
     parser.add_argument(
         "--prob_postprocess",
         type=str,
-        default="none",
+        default="temperature",
         choices=["none", "temperature", "shrink", "clip"],
-        help="Post-process probabilities only when saving final prediction CSVs. Training and model selection stay unchanged.",
+        help="Post-process saved final prediction probabilities only; the paper protocol uses temperature scaling with T=4. Training and model selection stay unchanged.",
     )
     parser.add_argument(
         "--prob_temperature",
