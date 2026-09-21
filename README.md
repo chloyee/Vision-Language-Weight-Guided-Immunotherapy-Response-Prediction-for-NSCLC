@@ -147,7 +147,7 @@ python select_alignment_lambda.py \
 
 The selected value, all validation AUCs, and the final test results are saved under `results/alignment_lambda_selection/`. The selected numerical value should also be stated in the manuscript for exact reproducibility.
 
-The implementation scores all retained H&E candidates directly. This is equivalent to the terminal state of the paper's coordinate-expansion search, which is allowed to expand to the full case-level candidate set. Many IHC anchors may select the same H&E patch.
+Matching starts at each IHC anchor's corresponding location in the shared, already scale-mapped coordinate frame. Tile names are `y_x.png` (vertical then horizontal coordinate), with matching feature stems `y_x.pt`. Candidates are visited in clockwise expanding square rings, starting right and proceeding down, left, and up. Empty grid locations are skipped. Similarity is evaluated in batches of at most 128 retained candidates in spiral order. Every retained H&E candidate is visited without stopping at local maxima. The highest score wins, with ties resolved by the lowest original candidate index. Many IHC anchors may select the same H&E patch. Existing caches remain usable because coordinates are parsed from retained tile names. Invalid coordinate names raise an error.
 
 ## Ablations
 
