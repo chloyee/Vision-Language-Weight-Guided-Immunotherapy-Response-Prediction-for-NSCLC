@@ -147,6 +147,44 @@ def split_he_ihc_feature(feature_tensor, feature_dim=768):
     return flat[:feature_dim], flat[feature_dim:feature_dim * 2]
 
 
+def tile_coordinate_yx(tile_name):
+    """Read y_x tile names in the shared, already scale-mapped coordinate frame."""
+    stem = os.path.splitext(os.path.basename(str(tile_name)))[0]
+    match = re.fullmatch(r"(-?\d+)_(-?\d+)", stem)
+    if match is None:
+        raise ValueError(f"Expected y_x tile name in shared coordinates, got {tile_name!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def spiral_candidate_order(candidate_yx, origin_yx):
+    """Clockwise square spiral, starting at the origin then moving right.
+
+    Sort only retained tissue coordinates, skipping empty grid locations.
+    Increasing Chebyshev radius gives expanding square rings. Within each
+    ring the order is right edge down, bottom left, left up, then top right.
+    Coordinates can be grid indices or common-frame pixels without a stride.
+    """
+    oy, ox = origin_yx
+
+    def key(index):
+        y, x = candidate_yx[index]
+        dy, dx = y - oy, x - ox
+        radius = max(abs(dy), abs(dx))
+        if radius == 0:
+            return (0, 0, index)
+        if dx == radius and dy > -radius:
+            offset = dy + radius - 1
+        elif dy == radius:
+            offset = 2 * radius + (radius - 1 - dx)
+        elif dx == -radius:
+            offset = 4 * radius + (radius - 1 - dy)
+        else:
+            offset = 6 * radius + (dx + radius - 1)
+        return (radius, offset, index)
+
+    return sorted(range(len(candidate_yx)), key=key)
+
+
 def parse_pair_case_name(pair_case_name):
     parts = str(pair_case_name).split("__")
     if len(parts) >= 2:
@@ -1510,7 +1548,8 @@ class VGMS(nn.Module):
         s_align = mix_weights[0] * s_feat + mix_weights[1] * s_morph
         return s_feat, s_morph, s_align, mix_weights
 
-    def _align(self, he_features, ihc_features, he_h_map, ihc_h_map, source_indices):
+    def _align(self, he_features, ihc_features, he_h_map, ihc_h_map, source_indices,
+               he_tile_names=None, ihc_tile_names=None):
         n_he = int(he_features.shape[0])
         n_ihc = int(ihc_features.shape[0])
 
@@ -1521,13 +1560,47 @@ class VGMS(nn.Module):
             mix_weights = torch.tensor([1.0, 0.0], device=he_features.device)
             return aligned, idx, weight, None, None, None, mix_weights
 
-        s_feat, s_morph, s_align, mix_weights = self._similarity(
-            he_features,
-            ihc_features,
-            he_h_map,
-            ihc_h_map,
-        )
-        indices = torch.argmax(s_align, dim=1, keepdim=True)
+        if he_tile_names is None or ihc_tile_names is None:
+            raise ValueError("Spiral matching requires H&E and IHC y_x tile names")
+        if len(he_tile_names) != n_he or len(ihc_tile_names) != n_ihc or n_he == 0:
+            raise ValueError("Tile names must correspond one-to-one to nonempty feature rows")
+        he_yx = [tile_coordinate_yx(name) for name in he_tile_names]
+        ihc_yx = [tile_coordinate_yx(name) for name in ihc_tile_names]
+        feature_rows, morphology_rows, alignment_rows, selected = [], [], [], []
+        for i, origin in enumerate(ihc_yx):
+            order = spiral_candidate_order(he_yx, origin)
+            sf_row = he_features.new_empty(n_he, dtype=torch.float32)
+            sm_row = sf_row.clone()
+            sa_row = sf_row.clone()
+            best_score, best_index = -float("inf"), n_he
+            # Evaluate candidates in spiral order in bounded batches, never
+            # stopping at a local maximum. Every retained candidate is visited.
+            for start in range(0, n_he, 128):
+                candidate_ids = torch.tensor(order[start:start + 128],
+                                             dtype=torch.long, device=he_features.device)
+                sf, sm, sa, mix_weights = self._similarity(
+                    he_features[candidate_ids], ihc_features[i:i + 1],
+                    he_h_map[candidate_ids], ihc_h_map[i:i + 1],
+                )
+                sf_row[candidate_ids] = sf[0].float()
+                sm_row[candidate_ids] = sm[0].float()
+                sa_row[candidate_ids] = sa[0].float()
+                if not torch.isfinite(sa).all():
+                    raise ValueError("Non-finite similarity during spiral matching")
+                local_best = sa[0].max()
+                # Preserve original argmax tie handling irrespective of order.
+                local_index = int(candidate_ids[sa[0] == local_best].min().item())
+                score = float(local_best.item())
+                if score > best_score or (score == best_score and local_index < best_index):
+                    best_score, best_index = score, local_index
+            feature_rows.append(sf_row)
+            morphology_rows.append(sm_row)
+            alignment_rows.append(sa_row)
+            selected.append(best_index)
+        s_feat = torch.stack(feature_rows)
+        s_morph = torch.stack(morphology_rows)
+        s_align = torch.stack(alignment_rows)
+        indices = torch.tensor(selected, dtype=torch.long, device=he_features.device).unsqueeze(1)
         weights = torch.ones(n_ihc, 1, device=he_features.device)
         aligned = he_features[indices[:, 0]]
         return aligned, indices, weights, s_feat, s_morph, s_align, mix_weights
@@ -1570,6 +1643,8 @@ class VGMS(nn.Module):
                 he_h_map,
                 ihc_h_map,
                 source_indices,
+                sample.get("he_candidate_tile_names"),
+                sample.get("ihc_anchor_tile_names"),
             )
             matched_he_h = he_h[align_idx[:, 0]]
             visual_ihc = ihc_features
@@ -2383,7 +2458,7 @@ def parse_args():
         type=str,
         default="both",
         choices=["none", "feature", "morph", "both"],
-        help="Multi-stain alignment ablation: no alignment, feature-only, morphology-only, or learnable combination.",
+        help="Multi-stain alignment ablation: no alignment, feature-only, morphology-only, or fixed validation-selected combination.",
     )
     parser.add_argument("--align_topk", type=int, default=1, help="Compatibility option; paper protocol uses hard top-1 matching.")
     parser.add_argument("--align_temperature", type=float, default=0.1)
