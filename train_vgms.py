@@ -12,9 +12,9 @@ Each tile feature is expected to be either [2, 768] or flattened [1536]:
 
 No clinical variables are used.
 
-Each sampled IHC patch is matched to one H&E patch from the same case. Model
-input after fixed-lambda similarity alignment is:
-    [matched_HE_i, IHC_i, matched_HE_hematoxylin_i, IHC_DAB_i]
+Each sampled IHC anchor softly aggregates the Top-K H&E candidates from the
+same case. Model input after distance-aware fixed-lambda alignment is:
+    [weighted_HE_i, IHC_i, weighted_HE_hematoxylin_i, IHC_DAB_i]
 
 The model saves:
     - cached case tensors with CHIEF features and stain morphology descriptors
@@ -1456,7 +1456,7 @@ class VGMS(nn.Module):
         align_dim=256,
         dropout=0.35,
         align_topk=64,
-        temperature=0.1,
+        temperature=1.0,
         disable_morph_alignment=False,
         disable_query_guidance=False,
         disable_query_branch=False,
@@ -1464,6 +1464,9 @@ class VGMS(nn.Module):
         input_mode="multistain",
         alignment_mode="both",
         alignment_lambda=0.5,
+        spatial_gamma=0.25,
+        spatial_sigma=8.0,
+        patch_stride=250.0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -1477,8 +1480,15 @@ class VGMS(nn.Module):
         self.input_mode = str(input_mode).lower()
         self.alignment_mode = str(alignment_mode).lower()
         self.alignment_lambda = float(alignment_lambda)
+        self.spatial_gamma = float(spatial_gamma)
+        self.spatial_sigma = float(spatial_sigma)
+        self.patch_stride = float(patch_stride)
         if not 0.0 <= self.alignment_lambda <= 1.0:
             raise ValueError("alignment_lambda must be in [0, 1]")
+        if self.align_topk <= 0 or self.temperature <= 0:
+            raise ValueError("align_topk and align_temperature must be positive")
+        if self.spatial_gamma < 0 or self.spatial_sigma <= 0 or self.patch_stride <= 0:
+            raise ValueError("spatial_gamma must be nonnegative; spatial_sigma and patch_stride must be positive")
         if self.disable_alignment:
             self.alignment_mode = "none"
         if self.disable_morph_alignment and self.alignment_mode == "both":
@@ -1558,52 +1568,92 @@ class VGMS(nn.Module):
             aligned = he_features[idx[:, 0]]
             weight = torch.ones(n_ihc, 1, device=he_features.device)
             mix_weights = torch.tensor([1.0, 0.0], device=he_features.device)
-            return aligned, idx, weight, None, None, None, mix_weights
+            return aligned, idx, weight, None, None, None, None, None, None, mix_weights
 
         if he_tile_names is None or ihc_tile_names is None:
             raise ValueError("Spiral matching requires H&E and IHC y_x tile names")
         if len(he_tile_names) != n_he or len(ihc_tile_names) != n_ihc or n_he == 0:
             raise ValueError("Tile names must correspond one-to-one to nonempty feature rows")
+
         he_yx = [tile_coordinate_yx(name) for name in he_tile_names]
         ihc_yx = [tile_coordinate_yx(name) for name in ihc_tile_names]
-        feature_rows, morphology_rows, alignment_rows, selected = [], [], [], []
+        feature_rows, morphology_rows, base_rows = [], [], []
+
         for i, origin in enumerate(ihc_yx):
             order = spiral_candidate_order(he_yx, origin)
             sf_row = he_features.new_empty(n_he, dtype=torch.float32)
             sm_row = sf_row.clone()
-            sa_row = sf_row.clone()
-            best_score, best_index = -float("inf"), n_he
-            # Evaluate candidates in spiral order in bounded batches, never
-            # stopping at a local maximum. Every retained candidate is visited.
+            sb_row = sf_row.clone()
+
+            # Spiral order makes traversal deterministic. Every retained H&E
+            # candidate is scored; selection is performed globally afterwards.
             for start in range(0, n_he, 128):
-                candidate_ids = torch.tensor(order[start:start + 128],
-                                             dtype=torch.long, device=he_features.device)
-                sf, sm, sa, mix_weights = self._similarity(
-                    he_features[candidate_ids], ihc_features[i:i + 1],
-                    he_h_map[candidate_ids], ihc_h_map[i:i + 1],
+                candidate_ids = torch.tensor(
+                    order[start:start + 128],
+                    dtype=torch.long,
+                    device=he_features.device,
+                )
+                sf, sm, sb, mix_weights = self._similarity(
+                    he_features[candidate_ids],
+                    ihc_features[i:i + 1],
+                    he_h_map[candidate_ids],
+                    ihc_h_map[i:i + 1],
                 )
                 sf_row[candidate_ids] = sf[0].float()
                 sm_row[candidate_ids] = sm[0].float()
-                sa_row[candidate_ids] = sa[0].float()
-                if not torch.isfinite(sa).all():
+                sb_row[candidate_ids] = sb[0].float()
+                if not torch.isfinite(sb).all():
                     raise ValueError("Non-finite similarity during spiral matching")
-                local_best = sa[0].max()
-                # Preserve original argmax tie handling irrespective of order.
-                local_index = int(candidate_ids[sa[0] == local_best].min().item())
-                score = float(local_best.item())
-                if score > best_score or (score == best_score and local_index < best_index):
-                    best_score, best_index = score, local_index
+
             feature_rows.append(sf_row)
             morphology_rows.append(sm_row)
-            alignment_rows.append(sa_row)
-            selected.append(best_index)
+            base_rows.append(sb_row)
+
         s_feat = torch.stack(feature_rows)
         s_morph = torch.stack(morphology_rows)
-        s_align = torch.stack(alignment_rows)
-        indices = torch.tensor(selected, dtype=torch.long, device=he_features.device).unsqueeze(1)
-        weights = torch.ones(n_ihc, 1, device=he_features.device)
-        aligned = he_features[indices[:, 0]]
-        return aligned, indices, weights, s_feat, s_morph, s_align, mix_weights
+        s_base = torch.stack(base_rows)
+
+        # Tile names store common-frame pixel coordinates. Convert to patch-grid
+        # units so sigma=8 has the same meaning for every slide.
+        he_yx_tensor = torch.tensor(
+            he_yx, dtype=torch.float32, device=he_features.device
+        ) / self.patch_stride
+        ihc_yx_tensor = torch.tensor(
+            ihc_yx, dtype=torch.float32, device=he_features.device
+        ) / self.patch_stride
+        pairwise_distance = torch.cdist(ihc_yx_tensor, he_yx_tensor, p=2)
+        spatial_penalty = pairwise_distance.square() / (2.0 * self.spatial_sigma ** 2)
+
+        # Distance-aware Eq. (4). Both Top-K selection and softmax weighting use
+        # the same logits, so the selected neighborhood and aggregation agree.
+        s_align = s_base - self.spatial_gamma * spatial_penalty
+        if not torch.isfinite(s_align).all():
+            raise ValueError("Non-finite distance-aware alignment logits")
+
+        k = min(self.align_topk, n_he)
+        indices = torch.argsort(
+            s_align, dim=1, descending=True, stable=True
+        )[:, :k]
+        top_logits = torch.gather(s_align, 1, indices)
+        weights = torch.softmax(top_logits / self.temperature, dim=1)
+        selected_he = he_features[indices]
+        aligned = torch.einsum(
+            "nk,nkd->nd",
+            weights.to(selected_he.dtype),
+            selected_he,
+        )
+        return (
+            aligned,
+            indices,
+            weights,
+            s_feat,
+            s_morph,
+            s_base,
+            s_align,
+            pairwise_distance,
+            spatial_penalty,
+            mix_weights,
+        )
 
     def forward(self, sample):
         he_features = sample["he_features"]
@@ -1624,7 +1674,8 @@ class VGMS(nn.Module):
             visual_dab = torch.zeros(n, device=he_features.device)
             align_idx = torch.zeros(n, 1, dtype=torch.long, device=he_features.device)
             align_weights = torch.ones(n, 1, device=he_features.device)
-            s_feat = s_morph = s_align = None
+            s_feat = s_morph = s_base = s_align = None
+            pairwise_distance = spatial_penalty = None
             align_mix = zero_align
         elif self.input_mode == "ihc":
             n = int(ihc_features.shape[0])
@@ -1634,10 +1685,22 @@ class VGMS(nn.Module):
             visual_dab = ihc_dab
             align_idx = torch.arange(n, device=ihc_features.device).unsqueeze(1)
             align_weights = torch.ones(n, 1, device=ihc_features.device)
-            s_feat = s_morph = s_align = None
+            s_feat = s_morph = s_base = s_align = None
+            pairwise_distance = spatial_penalty = None
             align_mix = zero_align
         else:
-            matched_he, align_idx, align_weights, s_feat, s_morph, s_align, align_mix = self._align(
+            (
+                matched_he,
+                align_idx,
+                align_weights,
+                s_feat,
+                s_morph,
+                s_base,
+                s_align,
+                pairwise_distance,
+                spatial_penalty,
+                align_mix,
+            ) = self._align(
                 he_features,
                 ihc_features,
                 he_h_map,
@@ -1646,7 +1709,11 @@ class VGMS(nn.Module):
                 sample.get("he_candidate_tile_names"),
                 sample.get("ihc_anchor_tile_names"),
             )
-            matched_he_h = he_h[align_idx[:, 0]]
+            selected_he_h = he_h[align_idx]
+            matched_he_h = torch.sum(
+                align_weights.to(selected_he_h.dtype) * selected_he_h,
+                dim=1,
+            )
             visual_ihc = ihc_features
             visual_dab = ihc_dab
 
@@ -1699,7 +1766,10 @@ class VGMS(nn.Module):
             "align_mix_weights": align_mix,
             "s_feat": s_feat,
             "s_morph": s_morph,
+            "s_base": s_base,
             "s_align": s_align,
+            "pairwise_distance": pairwise_distance,
+            "spatial_penalty": spatial_penalty,
         }
         return logit, outputs
 
@@ -1736,10 +1806,15 @@ def attention_entropy(weights):
     return (entropy / denom).mean()
 
 
-def compute_metrics(labels, probs, n_bootstraps=1000, seed=42):
+def compute_metrics(labels, probs, n_bootstraps=2000, seed=42, groups=None):
     labels = np.asarray(labels).astype(int)
     probs = np.asarray(probs).astype(float)
     preds = (probs >= 0.5).astype(int)
+    if groups is None:
+        groups = np.arange(len(labels))
+    groups = np.asarray(groups)
+    if len(groups) != len(labels):
+        raise ValueError("groups must have the same length as labels")
 
     auc_value = float("nan")
     ci_low = float("nan")
@@ -1747,9 +1822,14 @@ def compute_metrics(labels, probs, n_bootstraps=1000, seed=42):
     if len(np.unique(labels)) > 1:
         auc_value = roc_auc_score(labels, probs)
         rng = np.random.RandomState(seed)
+        unique_groups = pd.unique(groups)
+        group_members = [np.flatnonzero(groups == group) for group in unique_groups]
         aucs = []
         for _ in range(n_bootstraps):
-            idx = resample(np.arange(len(labels)), replace=True, random_state=rng)
+            sampled_group_ids = rng.randint(
+                0, len(unique_groups), size=len(unique_groups)
+            )
+            idx = np.concatenate([group_members[k] for k in sampled_group_ids])
             if len(np.unique(labels[idx])) < 2:
                 continue
             aucs.append(roc_auc_score(labels[idx], probs[idx]))
@@ -1765,7 +1845,6 @@ def compute_metrics(labels, probs, n_bootstraps=1000, seed=42):
         "F1": f1_score(labels, preds, zero_division=0),
         "Confusion_Matrix": str(confusion_matrix(labels, preds).tolist()),
     }
-
 
 def sigmoid_float(logit_value):
     logit_value = float(logit_value)
@@ -1857,7 +1936,10 @@ def save_case_intermediate(out_dir, split_name, sample, outputs):
         "align_mix_weights": detach_np(outputs["align_mix_weights"]),
         "s_feat": detach_np(outputs["s_feat"]),
         "s_morph": detach_np(outputs["s_morph"]),
+        "s_base": detach_np(outputs["s_base"]),
         "s_align": detach_np(outputs["s_align"]),
+        "pairwise_distance": detach_np(outputs["pairwise_distance"]),
+        "spatial_penalty": detach_np(outputs["spatial_penalty"]),
         "final_feature": detach_np(outputs["final_feature"]),
     }
     np.savez_compressed(path, **data)
@@ -1901,6 +1983,11 @@ def save_predictions_and_metrics(results_dir, split_name, rows, args):
         probs=pred_df["predict_probability"].values,
         n_bootstraps=args.n_bootstraps,
         seed=args.seed,
+        groups=(
+            pred_df["case_id"].values
+            if "case_id" in pred_df.columns
+            else np.arange(len(pred_df))
+        ),
     )
     metrics_df = pd.DataFrame([metrics])
     metrics_path = os.path.join(results_dir, f"{split_name}_wsi_metrics.csv")
@@ -2264,6 +2351,9 @@ def train(args):
         input_mode=args.input_mode,
         alignment_mode=args.alignment_mode,
         alignment_lambda=args.alignment_lambda,
+        spatial_gamma=args.spatial_gamma,
+        spatial_sigma=args.spatial_sigma,
+        patch_stride=args.patch_size,
     ).to(device)
 
     criterion = make_criterion(args, train_df, device)
@@ -2384,7 +2474,7 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train hard-aligned H&E-IHC VGMS without clinical variables."
+        description="Train distance-aware Top-64 H&E-IHC VGMS without clinical variables."
     )
     parser.add_argument("--project_name", type=str, default="cohort1")
     parser.add_argument("--external_project_name", type=str, default="cohort2")
@@ -2460,8 +2550,25 @@ def parse_args():
         choices=["none", "feature", "morph", "both"],
         help="Multi-stain alignment ablation: no alignment, feature-only, morphology-only, or fixed validation-selected combination.",
     )
-    parser.add_argument("--align_topk", type=int, default=1, help="Compatibility option; paper protocol uses hard top-1 matching.")
-    parser.add_argument("--align_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--align_topk",
+        type=int,
+        default=64,
+        help="Number of H&E candidates softly aggregated for each IHC anchor.",
+    )
+    parser.add_argument("--align_temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--spatial_gamma",
+        type=float,
+        default=0.25,
+        help="Weight of the Gaussian spatial distance penalty in Eq. (4).",
+    )
+    parser.add_argument(
+        "--spatial_sigma",
+        type=float,
+        default=8.0,
+        help="Gaussian spatial scale in patch-grid units.",
+    )
     parser.add_argument(
         "--alignment_lambda",
         type=float,
@@ -2515,9 +2622,9 @@ def parse_args():
         help="fast_gray is much faster; macenko matches the stain-separation idea but is CPU-heavy.",
     )
 
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--loss", type=str, default="focal", choices=["bce", "focal"])
@@ -2537,7 +2644,7 @@ def parse_args():
     )
     parser.add_argument("--train_on_all", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n_bootstraps", type=int, default=1000)
+    parser.add_argument("--n_bootstraps", type=int, default=2000)
 
     parser.add_argument(
         "--prob_postprocess",
