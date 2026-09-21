@@ -26,8 +26,8 @@ def parse_args():
         default=[0.0, 0.25, 0.5, 0.75, 1.0],
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--val_size", type=float, default=2.0 / 7.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_patches_per_case", type=int, default=1024)
