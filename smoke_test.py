@@ -46,9 +46,17 @@ def test_forward_backward():
     logit, outputs = model(sample)
     assert logit.ndim == 0
     assert outputs["query_weights"].shape == (6, 7)
-    assert outputs["align_indices"].shape == (7, 1)
+    assert outputs["align_indices"].shape == (7, 11)
+    assert outputs["align_weights"].shape == (7, 11)
     assert outputs["s_feat"].shape == (7, 11)
     assert outputs["s_morph"].shape == (7, 11)
+    assert outputs["s_base"].shape == (7, 11)
+    assert outputs["pairwise_distance"].shape == (7, 11)
+    assert torch.allclose(
+        outputs["align_weights"].sum(dim=1),
+        torch.ones(7),
+        atol=1e-6,
+    )
     assert torch.allclose(
         outputs["query_weights"].sum(dim=1),
         torch.ones(6),
@@ -114,23 +122,47 @@ def test_spiral_matching():
     assert tile_coordinate_yx("250_500.png") == (250, 500)
     sparse = [points[i] for i in [8, 0, 5, 2]]
     assert spiral_candidate_order(sparse, (0, 0)) == [1, 3, 2, 0]
-    model = VGMS(torch.randn(6, 24), feature_dim=16, hidden_dim=12, dropout=0.0)
+
+    model = VGMS(
+        torch.randn(6, 24),
+        feature_dim=16,
+        hidden_dim=12,
+        dropout=0.0,
+        align_topk=64,
+        temperature=1.0,
+        spatial_gamma=0.25,
+        spatial_sigma=8.0,
+        patch_stride=250.0,
+    )
     sample = make_sample(n_he=277, n_ihc=7)
     for mode in ["both", "feature", "morph"]:
         model.alignment_mode = mode
         _, output = model(sample)
-        _, _, dense, _ = model._similarity(sample["he_features"], sample["ihc_features"],
-                                           sample["he_h_map"], sample["ihc_h_map"])
-        assert torch.allclose(output["s_align"], dense, atol=1e-6)
-        assert torch.equal(output["align_indices"], dense.argmax(dim=1, keepdim=True))
-    # Equal scores allow many anchors to choose candidate zero, even when
-    # candidate zero is not first in their spiral traversal.
+        _, _, base, _ = model._similarity(
+            sample["he_features"],
+            sample["ihc_features"],
+            sample["he_h_map"],
+            sample["ihc_h_map"],
+        )
+        expected = base - model.spatial_gamma * output["spatial_penalty"]
+        expected_indices = torch.argsort(
+            expected, dim=1, descending=True, stable=True
+        )[:, :64]
+        assert torch.allclose(output["s_base"], base, atol=1e-6)
+        assert torch.allclose(output["s_align"], expected, atol=1e-6)
+        assert torch.equal(output["align_indices"], expected_indices)
+        assert output["align_indices"].shape == (7, 64)
+        assert torch.allclose(
+            output["align_weights"].sum(dim=1), torch.ones(7), atol=1e-6
+        )
+
+    # With equal feature scores, the spatial term makes the exact-coordinate
+    # H&E patch the highest-ranked candidate for each IHC anchor.
     sample["he_features"].zero_()
     sample["ihc_features"].zero_()
     model.alignment_mode = "feature"
     _, output = model(sample)
-    assert torch.equal(output["align_indices"], torch.zeros(7, 1, dtype=torch.long))
-
+    assert torch.equal(output["align_indices"][:, 0], torch.arange(7))
 
 def main():
     torch.manual_seed(42)
