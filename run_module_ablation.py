@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--alignment_lambda", type=float, default=0.5)
     parser.add_argument("--max_patches_per_case", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--prob_postprocess", choices=["none", "temperature", "shrink", "clip"], default="temperature")
+    parser.add_argument("--prob_temperature", type=float, default=4.0)
     parser.add_argument("--include_full", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
@@ -63,7 +65,8 @@ def build_command(args, experiment):
         "--num_workers", str(args.num_workers),
         "--input_mode", input_mode,
         "--alignment_mode", alignment_mode,
-        "--prob_postprocess", "none",
+        "--prob_postprocess", args.prob_postprocess,
+        "--prob_temperature", str(args.prob_temperature),
         "--amp",
         "--tf32",
         "--no_save_train_intermediates",
