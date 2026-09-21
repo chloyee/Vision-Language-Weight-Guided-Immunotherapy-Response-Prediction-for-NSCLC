@@ -30,6 +30,8 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--val_size", type=float, default=2.0 / 7.0)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prob_postprocess", choices=["none", "temperature", "shrink", "clip"], default="temperature")
+    parser.add_argument("--prob_temperature", type=float, default=4.0)
     parser.add_argument("--max_patches_per_case", type=int, default=1024)
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
@@ -55,7 +57,8 @@ def base_command(args, results_dir, alignment_lambda, skip_test):
         "--alignment_mode", "both",
         "--morphology_mode", "macenko",
         "--loss", "focal",
-        "--prob_postprocess", "none",
+        "--prob_postprocess", args.prob_postprocess,
+        "--prob_temperature", str(args.prob_temperature),
         "--amp",
         "--tf32",
         "--no_save_train_intermediates",
