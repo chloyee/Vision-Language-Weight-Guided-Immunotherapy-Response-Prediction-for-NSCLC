@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import torch
 from safe_spiral import bounded_spiral_align
+from stain_scaling import SCALAR_SCHEMA, prepare_stain_scaler, scale_case
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -439,9 +440,8 @@ def color_deconvolution_macenko(img, stain_type="he"):
         best = np.argmin(residual, axis=1)
         concentrations = candidates[np.arange(len(candidates)), best]
         concentrations = concentrations.reshape(img.shape[0], img.shape[1], 2)
-    except np.linalg.LinAlgError:
-        h, w, _ = img.shape
-        concentrations = np.zeros((h, w, 2), dtype=np.float32)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Stain concentration decomposition failed") from exc
 
     concentrations_norm = np.zeros_like(concentrations, dtype=np.uint8)
     for i in range(2):
@@ -519,7 +519,15 @@ def fast_dab_proxy(image):
     return np.clip(brown, 0.0, 1.0)
 
 
-def compute_he_morphology(he_path, mode="macenko", map_size=32):
+def compute_he_morphology(he_path, mode="macenko", map_size=32, scalar_mode="legacy_patch_mean"):
+    if scalar_mode == "train_standardized":
+        if mode != "macenko" or not he_path or not os.path.isfile(he_path):
+            raise ValueError("Raw H concentration requires a Macenko RGB H&E patch")
+        norm, raw, _ = color_deconvolution_macenko(load_rgb(he_path), stain_type="he")
+        if not np.isfinite(raw).all() or np.any(raw < 0):
+            raise ValueError("Invalid H&E concentration map")
+        h_channel = 255.0 - norm[:, :, 0].astype(np.float32)
+        return float(raw[:, :, 0].mean()), channel_descriptor(h_channel), normalize_stain_map(h_channel, map_size)
     if mode == "none":
         return 0.0, zero_morph(), zero_hematoxylin_map(map_size)
     if not he_path or not os.path.exists(he_path):
@@ -537,7 +545,16 @@ def compute_he_morphology(he_path, mode="macenko", map_size=32):
         return 0.0, zero_morph(), zero_hematoxylin_map(map_size)
 
 
-def compute_ihc_morphology(ihc_path, dab_path, mode="macenko", map_size=32):
+def compute_ihc_morphology(ihc_path, dab_path, mode="macenko", map_size=32, scalar_mode="legacy_patch_mean"):
+    if scalar_mode == "train_standardized":
+        if mode != "macenko" or not ihc_path or not os.path.isfile(ihc_path):
+            raise ValueError("Raw H/DAB concentrations require a Macenko RGB IHC patch")
+        norm, raw, _ = color_deconvolution_macenko(load_rgb(ihc_path), stain_type="ihc")
+        if not np.isfinite(raw).all() or np.any(raw < 0):
+            raise ValueError("Invalid IHC concentration map")
+        h_channel = 255.0 - norm[:, :, 1].astype(np.float32)
+        # Never replace raw concentrations with independently normalized DAB PNGs.
+        return float(raw[:, :, 1].mean()), float(raw[:, :, 0].mean()), channel_descriptor(h_channel), normalize_stain_map(h_channel, map_size)
     h_desc = zero_morph()
     h_map = zero_hematoxylin_map(map_size)
     dab_mean = 0.0
@@ -598,7 +615,8 @@ def list_tile_feature_paths(base_path, project_name, pair_case_name):
 
 
 def get_case_cache_path(row, args, cache_dir, project_name, pair_case_name):
-    cache_tag = f"paper_v1_ps{args.patch_size}_ssim{args.ssim_map_size}_{args.morphology_mode}"
+    scalar_mode = getattr(args, "stain_scalar_mode", "train_standardized")
+    cache_tag = f"paper_v2_{scalar_mode}_ps{args.patch_size}_ssim{args.ssim_map_size}_{args.morphology_mode}"
     feature_source = str(getattr(args, "feature_source", "fusion_tiles")).lower()
     if feature_source == "wsi_pt":
         encoder_name = safe_name(getattr(args, "image_encoder_name", "wsi_encoder"))
@@ -725,12 +743,14 @@ def build_or_load_case_cache(row, args, cache_dir):
             he_patch_path,
             mode=args.morphology_mode,
             map_size=args.ssim_map_size,
+            scalar_mode=getattr(args, "stain_scalar_mode", "train_standardized"),
         )
         ihc_h, ihc_dab, ihc_morph, ihc_h_map = compute_ihc_morphology(
             ihc_patch_path,
             dab_patch_path,
             mode=args.morphology_mode,
             map_size=args.ssim_map_size,
+            scalar_mode=getattr(args, "stain_scalar_mode", "train_standardized"),
         )
 
         he_features.append(he_feature)
@@ -751,6 +771,7 @@ def build_or_load_case_cache(row, args, cache_dir):
         raise RuntimeError(f"No usable features found for case {pair_case_name}")
 
     case_obj = {
+        "stain_scalar_schema": SCALAR_SCHEMA if getattr(args, "stain_scalar_mode", "train_standardized") == "train_standardized" else "legacy_patch_mean",
         "case_id": case_id,
         "project_name": project_name,
         "pair_case_name": pair_case_name,
@@ -1097,6 +1118,8 @@ class CaseMILDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
         case_obj = build_or_load_case_cache(row, self.args, self.cache_dir)
+        if getattr(self.args, "stain_scalar_mode", "train_standardized") == "train_standardized":
+            case_obj = scale_case(case_obj, getattr(self.args, "stain_scaler", None))
         n_ihc = int(case_obj["ihc_features"].shape[0])
         keep_ihc = self._sample_indices(n_ihc, idx)
         keep_ihc_t = torch.tensor(keep_ihc, dtype=torch.long)
@@ -1586,9 +1609,9 @@ class VGMS(nn.Module):
     def forward(self, sample):
         he_features = sample["he_features"]
         ihc_features = sample["ihc_features"]
-        he_h = sample["he_h"].float().clamp(0.0, 1.0)
-        ihc_h = sample["ihc_h"].float().clamp(0.0, 1.0)
-        ihc_dab = sample["ihc_dab"].float().clamp(0.0, 1.0)
+        he_h = sample["he_h"].float()
+        ihc_h = sample["ihc_h"].float()
+        ihc_dab = sample["ihc_dab"].float()
         he_h_map = sample["he_h_map"].float().clamp(0.0, 1.0)
         ihc_h_map = sample["ihc_h_map"].float().clamp(0.0, 1.0)
         source_indices = sample["ihc_source_indices"]
@@ -2165,9 +2188,7 @@ def build_dataframes(args):
 
     if args.prebuild_cache or args.cache_only:
         prebuild_case_caches(args, train_df, val_df, test_df, external_df)
-        if args.cache_only:
-            print("[DONE] --cache_only was set, stop after cache prebuild.")
-            raise SystemExit(0)
+
 
     split_case_ids = {
         "train": set(train_df["case_id"].astype(str)),
@@ -2184,6 +2205,8 @@ def build_dataframes(args):
                     + ", ".join(sorted(overlap)[:10])
                 )
 
+    prepare_stain_scaler(args, train_df, build_or_load_case_cache, get_cache_dir(args))
+    save_json(vars(args), os.path.join(args.results_dir, "config.json"))
     save_split_csv(train_df, os.path.join(split_dir, "train_cases.csv"))
     save_split_csv(val_df, os.path.join(split_dir, "val_cases.csv"))
     save_split_csv(test_df, os.path.join(split_dir, "internal_test_cases.csv"))
@@ -2194,6 +2217,9 @@ def build_dataframes(args):
         f"[INFO] Split cases: train={len(train_df)}, val={len(val_df)}, "
         f"internal_test={len(test_df)}, external={len(external_df)}"
     )
+    if args.cache_only:
+        print("[DONE] Cache construction and training-only stain scaler fitting completed.")
+        raise SystemExit(0)
     return train_df, val_df, test_df, external_df
 
 
@@ -2551,6 +2577,10 @@ def parse_args():
         choices=["fast_gray", "macenko", "none"],
         help="fast_gray is much faster; macenko matches the stain-separation idea but is CPU-heavy.",
     )
+
+    parser.add_argument("--stain_scalar_mode", choices=["train_standardized", "legacy_patch_mean"],
+                        default="train_standardized",
+                        help="Fusion scalars: raw concentration means standardized using training-only channel statistics, or patch-relative means.")
 
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--patience", type=int, default=10)
