@@ -6,7 +6,7 @@ Reference implementation for:
 
 VGMS integrates paired hematoxylin and eosin (H&E) and PD-L1 immunohistochemistry (IHC) whole-slide image representations for pathological complete response prediction in non-small cell lung cancer. The repository contains the main training pipeline, single-stain baselines, module and encoder ablations, cohort visualization, result summarization, and query-attention heatmap generation.
 
-The default configuration follows the reported protocol. For each sampled IHC anchor, all retained H&E candidates from the same case are scored using hematoxylin-channel SSIM, CHIEF feature cosine similarity, and a Gaussian spatial-distance penalty. The highest-scoring 64 candidates are softmax weighted to aggregate both the H&E embedding and hematoxylin intensity. The aligned H&E representation is concatenated with the IHC CHIEF embedding and IHC DAB intensity, then projected. Six frozen ClinicalBERT query embeddings attend to the aligned visual tokens, and the six query-specific evidence vectors are concatenated for a three-layer gated MLP classifier.
+The default configuration follows the reported protocol. For each sampled IHC anchor, all retained H&E candidates from the same case are eligible for matching using hematoxylin-channel SSIM, CHIEF feature cosine similarity, and a Gaussian spatial-distance penalty. The highest-scoring 64 candidates are softmax weighted to aggregate both the H&E embedding and hematoxylin intensity. The aligned H&E representation is concatenated with the IHC CHIEF embedding and IHC DAB intensity, then projected. Six frozen ClinicalBERT query embeddings attend to the aligned visual tokens, and the six query-specific evidence vectors are concatenated for a three-layer gated MLP classifier.
 
 ## Repository contents
 
@@ -171,7 +171,15 @@ w_{ij}=\frac{\exp(\ell_{ij}/\tau)}{\sum_{k\in\mathcal{N}_i}\exp(\ell_{ik}/\tau)}
 
 with `tau=1`. The same weights aggregate H&E hematoxylin intensity.
 
-Matching starts at each IHC anchor's corresponding location in the shared, already scale-mapped coordinate frame. Tile names are `y_x.png` (vertical then horizontal coordinate), with matching feature stems `y_x.pt`. Candidates are visited in clockwise expanding square rings, and every retained H&E candidate is evaluated in batches of at most 128. Spiral traversal provides deterministic enumeration; spatial locality is imposed explicitly by the distance term. Top-64 selection and softmax weighting both use `ell_ij`, with ties resolved by the lowest original candidate index. Existing caches remain usable because coordinates are parsed from retained tile names. Invalid coordinate names raise an error.
+Matching starts at each IHC anchor's corresponding location in the shared, already scale-mapped coordinate frame. Tile names are `y_x.png` (vertical then horizontal coordinate), with matching feature stems `y_x.pt`. Candidates are visited in clockwise expanding square rings in batches of at most 128. Safe stopping uses the maximum spatial score upper bound over all unvisited candidates. Search stops only when this bound plus a numerical margin is strictly below the current Kth score. Otherwise it continues exhaustively. Spatial locality is imposed by the distance term, not by traversal order. Top-64 selection and softmax weighting both use `ell_ij`, with ties resolved by the lowest original candidate index. Existing caches remain usable because coordinates are parsed from retained tile names. Invalid coordinate names raise an error.
+
+## Safe stopping and exhaustive control
+
+Safe stopping is enabled by default. Prefix the normal command with `VGMS_SAFE_STOP=0` to score every candidate, or `VGMS_SAFE_STOP=1` for bounded search. `VGMS_SEARCH_BATCH` defaults to 128. Run `python test_safe_spiral.py` to compare indices, weights, outputs and gradients.
+
+The similarity mixture is bounded to [-1,1] and evaluated in FP32 outside AMP. Coordinates, penalties and logits use FP64. Both modes use identical new arithmetic. Bitwise equivalence to the previous AMP/FP32-cdist implementation is not guaranteed. CPU tests passed, while CUDA/AMP and real-checkpoint validation remain required. Compare the same checkpoint and inputs before training new experiments. No wall-clock speedup is claimed.
+
+Unscored diagnostic matrix entries are NaN and are identified by `alignment_evaluated_mask` in intermediate NPZ files. `model.last_search_stats` reports the last forward pass only. Dense diagnostics remain, so memory reduction is not claimed.
 
 ## Ablations
 
