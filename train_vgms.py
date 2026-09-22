@@ -39,6 +39,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from safe_spiral import bounded_spiral_align
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -1577,82 +1578,9 @@ class VGMS(nn.Module):
 
         he_yx = [tile_coordinate_yx(name) for name in he_tile_names]
         ihc_yx = [tile_coordinate_yx(name) for name in ihc_tile_names]
-        feature_rows, morphology_rows, base_rows = [], [], []
-
-        for i, origin in enumerate(ihc_yx):
-            order = spiral_candidate_order(he_yx, origin)
-            sf_row = he_features.new_empty(n_he, dtype=torch.float32)
-            sm_row = sf_row.clone()
-            sb_row = sf_row.clone()
-
-            # Spiral order makes traversal deterministic. Every retained H&E
-            # candidate is scored; selection is performed globally afterwards.
-            for start in range(0, n_he, 128):
-                candidate_ids = torch.tensor(
-                    order[start:start + 128],
-                    dtype=torch.long,
-                    device=he_features.device,
-                )
-                sf, sm, sb, mix_weights = self._similarity(
-                    he_features[candidate_ids],
-                    ihc_features[i:i + 1],
-                    he_h_map[candidate_ids],
-                    ihc_h_map[i:i + 1],
-                )
-                sf_row[candidate_ids] = sf[0].float()
-                sm_row[candidate_ids] = sm[0].float()
-                sb_row[candidate_ids] = sb[0].float()
-                if not torch.isfinite(sb).all():
-                    raise ValueError("Non-finite similarity during spiral matching")
-
-            feature_rows.append(sf_row)
-            morphology_rows.append(sm_row)
-            base_rows.append(sb_row)
-
-        s_feat = torch.stack(feature_rows)
-        s_morph = torch.stack(morphology_rows)
-        s_base = torch.stack(base_rows)
-
-        # Tile names store common-frame pixel coordinates. Convert to patch-grid
-        # units so sigma=8 has the same meaning for every slide.
-        he_yx_tensor = torch.tensor(
-            he_yx, dtype=torch.float32, device=he_features.device
-        ) / self.patch_stride
-        ihc_yx_tensor = torch.tensor(
-            ihc_yx, dtype=torch.float32, device=he_features.device
-        ) / self.patch_stride
-        pairwise_distance = torch.cdist(ihc_yx_tensor, he_yx_tensor, p=2)
-        spatial_penalty = pairwise_distance.square() / (2.0 * self.spatial_sigma ** 2)
-
-        # Distance-aware Eq. (4). Both Top-K selection and softmax weighting use
-        # the same logits, so the selected neighborhood and aggregation agree.
-        s_align = s_base - self.spatial_gamma * spatial_penalty
-        if not torch.isfinite(s_align).all():
-            raise ValueError("Non-finite distance-aware alignment logits")
-
-        k = min(self.align_topk, n_he)
-        indices = torch.argsort(
-            s_align, dim=1, descending=True, stable=True
-        )[:, :k]
-        top_logits = torch.gather(s_align, 1, indices)
-        weights = torch.softmax(top_logits / self.temperature, dim=1)
-        selected_he = he_features[indices]
-        aligned = torch.einsum(
-            "nk,nkd->nd",
-            weights.to(selected_he.dtype),
-            selected_he,
-        )
-        return (
-            aligned,
-            indices,
-            weights,
-            s_feat,
-            s_morph,
-            s_base,
-            s_align,
-            pairwise_distance,
-            spatial_penalty,
-            mix_weights,
+        return bounded_spiral_align(
+            self, he_features, ihc_features, he_h_map, ihc_h_map,
+            he_yx, ihc_yx, spiral_candidate_order,
         )
 
     def forward(self, sample):
@@ -1761,6 +1689,7 @@ class VGMS(nn.Module):
             "query_evidence": query_evidence,
             "query_importance": query_importance,
             "aligned_dab": visual_dab,
+            "alignment_evaluated_mask": getattr(self, "last_alignment_evaluated_mask", None) if s_align is not None else None,
             "align_indices": align_idx,
             "align_weights": align_weights,
             "align_mix_weights": align_mix,
@@ -1937,6 +1866,7 @@ def save_case_intermediate(out_dir, split_name, sample, outputs):
         "s_feat": detach_np(outputs["s_feat"]),
         "s_morph": detach_np(outputs["s_morph"]),
         "s_base": detach_np(outputs["s_base"]),
+        "alignment_evaluated_mask": detach_np(outputs.get("alignment_evaluated_mask")),
         "s_align": detach_np(outputs["s_align"]),
         "pairwise_distance": detach_np(outputs["pairwise_distance"]),
         "spatial_penalty": detach_np(outputs["spatial_penalty"]),
