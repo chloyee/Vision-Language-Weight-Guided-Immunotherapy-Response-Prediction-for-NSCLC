@@ -153,7 +153,7 @@ python select_alignment_lambda.py \
 
 The selected value, all validation AUCs, and the final test results are saved under `results/alignment_lambda_selection/`. The selected numerical value should also be stated in the manuscript for exact reproducibility.
 
-For IHC anchor `i` and H&E candidate `j`, the distance-aware alignment logit used in Eq. (4) is
+For IHC anchor `i` and H&E candidate `j`, the distance-aware alignment logit is
 
 ```math
 \ell_{ij}=\lambda s^{\mathrm{morph}}_{ij}+(1-\lambda)s^{\mathrm{feat}}_{ij}-\gamma\frac{\lVert \mathbf{p}^{I}_{i}-\mathbf{p}^{H}_{j}\rVert_2^2}{2\sigma^2}
@@ -178,32 +178,6 @@ The similarity mixture is bounded to [-1,1] and evaluated in FP32 outside AMP. C
 
 Unscored diagnostic matrix entries are NaN and are identified by `alignment_evaluated_mask` in intermediate NPZ files. `model.last_search_stats` reports the last forward pass only. Dense diagnostics remain, so memory reduction is not claimed.
 
-## Ablations
-
-```bash
-python run_module_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --prob_postprocess temperature --prob_temperature 4 --device cuda:0
-python run_text_encoder_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --prob_postprocess temperature --prob_temperature 4 --device cuda:0
-python run_image_encoder_ablation.py --base_path ./data/patches --alignment_lambda 0.5 --prob_postprocess temperature --prob_temperature 4 --device cuda:0
-```
-
-Replace `0.5` with the value selected by `select_alignment_lambda.py`. Use `--dry_run` to inspect generated commands before launching experiments.
-
-When vision-language weighting is disabled, the ablation uses a learned gated-attention MIL pooler instead of uniform averaging. This keeps the no-query comparison trainable while leaving the full VGMS query-attention path unchanged.
-
-## Query-attention visualization
-
-Create a private slide manifest following `slides.example.csv`, then run:
-
-```bash
-python visualize_query_attention.py \
-  --slides_csv ./slides.example.csv \
-  --ctranspath_weight ./model_weight/CHIEF_CTransPath.pth \
-  --out_dir ./results/query_attention \
-  --tile_size 80 --batch_size 64 --amp
-```
-
-Do not commit a populated manifest containing real slide paths or identifiers.
-
 ## Reproducibility and privacy
 
 - Random seed defaults to 42.
@@ -214,10 +188,3 @@ Do not commit a populated manifest containing real slide paths or identifiers.
 - Run `python verify_paper_protocol.py` to check paper-protocol defaults and core implementation markers.
 - Run `python smoke_test.py` after installing dependencies to validate model shapes, gradients, and patient-disjoint splitting.
 
-## Citation
-
-Citation information will be added after publication.
-
-## License
-
-This repository is provided for research evaluation. A formal reuse license will be added with the public release; until then, no redistribution or reuse license is granted.
