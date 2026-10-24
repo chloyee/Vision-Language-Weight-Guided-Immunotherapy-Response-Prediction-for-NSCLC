@@ -27,7 +27,7 @@ The default configuration follows the reported protocol. For each sampled IHC an
 
 ## Study cohorts
 
-The study uses retrospectively collected data from two hospitals. All splits are patient-disjoint. No image, clinical, label, split, or model-output files are included in this repository.
+The study uses retrospectively collected data from two hospitals. All splits are patient-level. 
 
 ### Full study population
 
@@ -44,13 +44,10 @@ The study uses retrospectively collected data from two hospitals. All splits are
 | Cohort 1 internal test | 80 | 96 | 80 | 96 |
 | Cohort 2 external test | 100 | 101 | 101 | 101 |
 
-Additional cohort characteristics, eligibility criteria, preprocessing details, and response distributions are reported in the paper.
 
 ## Data availability
 
-The source WSIs and associated clinical annotations cannot be made publicly available because they contain protected patient information and are governed by institutional ethics approvals and data-use restrictions. Access is therefore not provided through this repository. Researchers interested in validation should contact the corresponding authors and obtain separate institutional and ethics approval; availability remains subject to the participating hospitals' policies.
-
-The code expects de-identified identifiers. Do not place raw clinical exports, patient names, medical-record numbers, original split files, or identifiable slide filenames under version control.
+The source WSIs and associated clinical annotations cannot be made publicly available because they contain protected patient information and are governed by institutional ethics approvals and data-use restrictions. 
 
 ## Environment
 
@@ -118,9 +115,9 @@ python train_vgms.py \
   --amp --tf32
 ```
 
-Checkpoint selection and early stopping use only the validation subset derived from the training split. Internal and external test cohorts are excluded from training, hyperparameter selection, and early stopping. Temperature scaling with `T=4` is applied only to probabilities written to the final prediction CSV files; it does not alter training, checkpoint selection, the 0.5 decision boundary, or AUC ranking.
+Checkpoint selection and early stopping use only the validation subset derived from the training split.
 
-### Paper protocol defaults
+### Protocol defaults
 
 | Setting | Value |
 |---|---:|
