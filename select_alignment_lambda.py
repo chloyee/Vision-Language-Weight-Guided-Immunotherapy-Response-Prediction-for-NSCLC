@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -42,7 +43,7 @@ def base_command(args, results_dir, alignment_lambda, skip_test):
         sys.executable,
         args.train_script,
         "--project_name", args.project_name,
-        "--external_project_name", args.external_project_name,
+        "--external_project_name", ("" if skip_test else args.external_project_name),
         "--base_path", args.base_path,
         "--results_dir", results_dir,
         "--cache_dir", args.cache_dir,
@@ -59,8 +60,8 @@ def base_command(args, results_dir, alignment_lambda, skip_test):
         "--loss", "focal",
         "--prob_postprocess", args.prob_postprocess,
         "--prob_temperature", str(args.prob_temperature),
-        "--amp",
-        "--tf32",
+        "--stain_scalar_mode", "train_standardized",
+        "--n_bootstraps", "2000",
         "--no_save_train_intermediates",
     ]
     if args.train_split_csv:
@@ -79,7 +80,10 @@ def read_validation_auc(result_dir):
     frame = pd.read_csv(path)
     if frame.empty or "AUC" not in frame.columns:
         raise ValueError(f"Validation metrics contain no AUC: {path}")
-    return float(frame.iloc[0]["AUC"])
+    value = float(frame.iloc[0]["AUC"])
+    if not math.isfinite(value):
+        raise ValueError("Validation AUC must be finite")
+    return value
 
 
 def main():
