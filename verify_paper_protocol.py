@@ -1,4 +1,4 @@
-"""Static checks for the ICASSP paper protocol defaults."""
+"""Static checks for the ICASSP training configuration defaults."""
 
 import ast
 from pathlib import Path
@@ -28,6 +28,9 @@ EXPECTED_DEFAULTS = {
     "patch_size": 250,
     "morphology_mode": "macenko",
     "text_encoder_type": "clinicalbert",
+    "stain_scalar_mode": "train_standardized",
+    "ssim_map_size": 32,
+    "prob_logit_clip": 0.0,
 }
 
 
@@ -83,7 +86,7 @@ def main():
     errors = []
 
     if query_count(tree) != 6:
-        errors.append("DEFAULT_QUERIES must contain exactly six paper queries")
+        errors.append("DEFAULT_QUERIES must contain exactly six pathology queries")
     for name, expected in EXPECTED_DEFAULTS.items():
         actual = defaults.get(name)
         if isinstance(expected, float):
@@ -97,8 +100,8 @@ def main():
         "VGMS model class": "class VGMS(nn.Module)",
         "IHC-to-H&E feature cosine": "F.normalize(ihc_features, dim=1) @ F.normalize(he_features, dim=1).t()",
         "hematoxylin SSIM": "def _pairwise_ssim",
-        "spiral candidate traversal": "order = spiral_candidate_order(he_yx, origin)",
-        "distance-aware alignment": "s_base - self.spatial_gamma * spatial_penalty",
+        "spiral candidate traversal": "order_fn(he_yx, origin)",
+        "distance-aware alignment": "bounded.double() - deduction[i, ids]",
         "Top-64 selection": "torch.argsort(",
         "soft H&E aggregation": "torch.einsum(",
         "patient-cluster bootstrap": "group_members = [np.flatnonzero",
@@ -110,7 +113,7 @@ def main():
         "test-free hyperparameter selection": "args.skip_test_evaluation",
     }
     for label, snippet in required_snippets.items():
-        if snippet not in source:
+        if snippet not in source + (ROOT / "safe_spiral.py").read_text(encoding="utf-8"):
             errors.append(f"Missing {label}: {snippet}")
 
     lambda_selector = (ROOT / "select_alignment_lambda.py").read_text(encoding="utf-8")
@@ -119,12 +122,12 @@ def main():
             errors.append(f"Alignment-lambda selector is missing: {snippet}")
 
     if errors:
-        print("Paper protocol check failed:")
+        print("Training configuration check failed:")
         for error in errors:
             print(f"- {error}")
         raise SystemExit(1)
 
-    print("Paper protocol check passed.")
+    print("Training configuration check passed.")
 
 
 if __name__ == "__main__":
