@@ -40,3 +40,10 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
