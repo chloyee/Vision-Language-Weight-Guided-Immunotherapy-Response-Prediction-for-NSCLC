@@ -1,6 +1,6 @@
-"""Exact bounded spiral search. Copy next to train_vgms.py.
+"""Exact bounded spiral search for spatially regularized stain alignment.
 
-The exhaustive control uses the SAME bounded FP32 similarity and FP64 logits.
+The exhaustive control uses the same bounded FP32 similarity and FP64 logits.
 Unvisited diagnostic entries are NaN, not measured similarity values.
 """
 import math
