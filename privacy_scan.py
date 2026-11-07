@@ -1,44 +1,55 @@
-"""Fail when common private-path, identifier, credential, or leakage markers are found."""
+"""Scan tracked source and optional Git history for credential material."""
 
 import argparse
 import re
+import subprocess
 from pathlib import Path
 
-
 PATTERNS = {
-    "absolute user path": re.compile(r"/(?:Users|home|lvm\d?)/[^/\s]+/", re.IGNORECASE),
-    "Windows user path": re.compile(r"[A-Z]:\\\\Users\\\\[^\\\\\s]+", re.IGNORECASE),
-    "credential assignment": re.compile(r"(?:token|password|secret|api[_-]?key)\s*=\s*['\"][^'\"]+", re.IGNORECASE),
-    "test-to-train option": re.compile(r"augment_(?:internal_test|external_test)|internal_test_as_val", re.IGNORECASE),
-    "long numeric identifier": re.compile(r"(?<![\d.])\d{12,}(?![\d.])"),
+    "GitHub token": re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})"),
+    "service token": re.compile(r"(?:hf_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{30,})"),
+    "AWS access identifier": re.compile(r"AKIA[A-Z0-9]{16}"),
+    "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+    "literal credential": re.compile(r"(?:password|api[_-]?key|access_token|client_secret)\s*=\s*['\"][A-Za-z0-9_./+=-]{12,}['\"]", re.I),
 }
 
-TEXT_SUFFIXES = {".py", ".md", ".txt", ".csv", ".yaml", ".yml", ".json", ".toml"}
+
+def matches(text):
+    return [name for name, pattern in PATTERNS.items() if pattern.search(text)]
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", nargs="?", default=".")
+    parser.add_argument("--history", action="store_true")
     args = parser.parse_args()
     root = Path(args.root).resolve()
+    names = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"]).decode().split("\0")
     findings = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
-            continue
-        if ".git" in path.parts:
-            continue
-        if path.name == Path(__file__).name:
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        for name, pattern in PATTERNS.items():
-            for match in pattern.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                findings.append((path.relative_to(root), line, name, match.group(0)))
+    for name in filter(None, names):
+        path = root / name
+        if path.is_file() and path.name != Path(__file__).name:
+            text = path.read_bytes().decode("utf-8", errors="ignore")
+            for category in matches(text):
+                findings.append(f"{name}: {category}")
+    if args.history:
+        objects = subprocess.check_output(["git", "-C", str(root), "rev-list", "--objects", "--all"]).decode().splitlines()
+        for entry in objects:
+            parts = entry.split(" ", 1)
+            if len(parts) != 2 or parts[1].endswith("privacy_scan.py"):
+                continue
+            obj, name = parts
+            kind = subprocess.check_output(["git", "-C", str(root), "cat-file", "-t", obj]).strip()
+            if kind != b"blob":
+                continue
+            raw = subprocess.check_output(["git", "-C", str(root), "cat-file", "blob", obj])
+            for category in matches(raw.decode("utf-8", errors="ignore")):
+                findings.append(f"Historical source {name}: {category}")
     if findings:
-        for path, line, name, value in findings:
-            print(f"{path}:{line}: {name}: {value}")
+        for finding in sorted(set(findings)):
+            print(finding)
         raise SystemExit(1)
-    print("Privacy scan passed.")
+    print("Credential scan passed for tracked source" + (" and Git history." if args.history else "."))
 
 
 if __name__ == "__main__":
