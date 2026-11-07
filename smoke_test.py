@@ -1,4 +1,11 @@
-"""Small CPU smoke test for the paper-protocol model and split logic."""
+"""CPU checks for VGMS training, alignment and patient partitions."""
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from PIL import Image
 
 import numpy as np
 import pandas as pd
@@ -164,12 +171,59 @@ def test_spiral_matching():
     _, output = model(sample)
     assert torch.equal(output["align_indices"][:, 0], torch.arange(7))
 
+
+def test_training_pipeline():
+    """Run the actual entry point on synthetic RGB patches and frozen features."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        cohort = root / "data" / "cohort1"
+        rng = np.random.default_rng(42)
+        rows = []
+        for i in range(20):
+            he, ihc = f"he_{i:03d}", f"ihc_{i:03d}"
+            pair = he + "__" + ihc
+            feature_dir = cohort / "FusionFeatures_patch_level_tiles" / pair
+            he_dir = cohort / "patches_lv0_ps250" / "cohort1_HE_slides_data" / he
+            ihc_dir = cohort / "patches_lv0_ps250" / "cohort1_IHC_slides_data" / ihc
+            for path in (feature_dir, he_dir, ihc_dir):
+                path.mkdir(parents=True, exist_ok=True)
+            for tile in ("0_0", "0_250"):
+                torch.save(torch.from_numpy(rng.normal(size=(2, 16)).astype(np.float32)), feature_dir / (tile + ".pt"))
+                for path in (he_dir, ihc_dir):
+                    Image.fromarray(rng.integers(30, 230, size=(250, 250, 3), dtype=np.uint8)).save(path / (tile + ".png"))
+            rows.append(dict(case_id=f"patient_{i:03d}", he_file=he + ".svs", ihc_file=ihc + ".svs", pair_case_name=pair, label=i % 2))
+        pd.DataFrame(rows).to_csv(cohort / "pair_labels_with_case_id.csv", index=False)
+        query_file = root / "queries.npy"
+        np.save(query_file, rng.normal(size=(6, 24)).astype(np.float32))
+        result = root / "results"
+        subprocess.run([
+            sys.executable, str(Path(__file__).with_name("train_vgms.py")),
+            "--base_path", str(root / "data"), "--external_project_name", "",
+            "--results_dir", str(result), "--query_embedding_path", str(query_file),
+            "--epochs", "1", "--patience", "1", "--num_workers", "0", "--device", "cpu",
+            "--feature_dim", "16", "--hidden_dim", "12", "--align_topk", "2",
+            "--n_bootstraps", "20", "--no_save_train_intermediates",
+        ], check=True)
+        checkpoint = torch.load(result / "best_model.pth", map_location="cpu")
+        assert checkpoint["args"]["stain_scalar_mode"] == "train_standardized"
+        with open(result / "stain_scaler.json") as stream:
+            scaler = json.load(stream)
+        assert checkpoint["args"]["stain_scaler"] == scaler
+        assert scaler["channels"]["he_h"]["count"] == 20
+        predictions = pd.read_csv(result / "internal_test_best_wsi_predictions.csv")
+        assert len(predictions) == 6
+        assert predictions["predict_probability"].between(0, 1).all()
+        groups = [set(pd.read_csv(result / "splits" / name)["case_id"]) for name in ("train_cases.csv", "val_cases.csv", "internal_test_cases.csv")]
+        assert not (groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+
+
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
     test_spiral_matching()
     test_forward_backward()
     test_patient_disjoint_split()
+    test_training_pipeline()
     print("VGMS smoke test passed.")
 
 
