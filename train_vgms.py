@@ -2611,7 +2611,7 @@ def parse_args():
         "--val_size",
         type=float,
         default=2.0 / 7.0,
-        help="Validation fraction within the 70% development pool; 2/7 yields a 5:2:3 split.",
+        help="Validation fraction within the 70%% development pool; 2/7 yields a 5:2:3 split.",
     )
     parser.add_argument("--train_on_all", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
