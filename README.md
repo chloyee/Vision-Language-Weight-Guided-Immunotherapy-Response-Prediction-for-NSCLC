@@ -6,7 +6,7 @@ VGMS combines cross-stain correspondence with pathology-guided aggregation for p
 
 ## Installation
 
-Use Python 3.11.4 with PyTorch 2.1.0 and CUDA 12.1. The experimental hardware consists of two NVIDIA RTX 4090 GPUs. Each training process selects one device through `--device`.
+Use Python 3.11.4 with PyTorch 2.1.0 and CUDA 12.1. Select a GPU through `--device`, for example `cuda:0`.
 
 ```bash
 python -m venv .venv
@@ -16,7 +16,11 @@ python -m pip install torch==2.1.0 torchvision==0.16.0 --index-url https://downl
 python -m pip install -r requirements.txt
 ```
 
-## Data preparation
+## Training on your own data
+
+The study datasets are not publicly available. VGMS supports training on your own paired H&E and IHC data using the input format below. Dataset sizes and partition proportions can be chosen for your study. Keep all slides and image pairs from each patient in the same partition.
+
+### Input format
 
 Training starts from color-normalized RGB tissue patches and frozen CHIEF features. Prepare non-overlapping 250 x 250 patches at 40x. Map slide coordinates into a shared frame using the H&E and IHC slide dimensions. Name patches `y_x.png` and feature files `y_x.pt`, where y and x are vertical and horizontal **pixel coordinates in that shared frame**. The model divides these coordinates by 250 when computing distances.
 
@@ -60,33 +64,22 @@ example_patient_001,example_he_001.svs,example_ihc_001.svs,example_he_001__examp
 - `pair_case_name` identifies the feature directory.
 - Optional `he_patches_path` and `ihc_patches_path` fields specify alternative RGB patch directories.
 
-Fixed split CSVs contain `case_id,he_file,ihc_file,label`. `train_split.csv` is the **70% development pool**, from which 2/7 of patients form validation and 5/7 form training. `test_split.csv` contains the remaining 30% of patients. With no fixed split files, the loader creates the same 5:2:3 response-stratified patient partition. All image pairs from a patient remain together. The files `train_split.example.csv` and `test_split.example.csv` illustrate the schema with synthetic identifiers.
+### Dataset partitions
+
+Fixed split CSVs contain `case_id,he_file,ihc_file,label`. Supply your development pool through `--train_split_csv` and your held-out evaluation set through `--test_split_csv`. The development pool contains both training and validation patients. `--val_size` controls the validation fraction within that pool, with a default of 2/7. The development and evaluation pools can have sizes appropriate to your dataset.
+
+Without split files, the loader uses a response-stratified, patient-disjoint 5:2:3 training/validation/test split by default. The files `train_split.example.csv` and `test_split.example.csv` illustrate the schema using synthetic identifiers. Both training and validation subsets need positive and negative examples. An independent evaluation cohort is optional.
 
 The training entry point consumes these prepared patches and embeddings. Obtain the CHIEF encoder from its original distribution and preserve the feature-to-patch correspondence during extraction. Bio_ClinicalBERT is loaded from `emilyalsentzer/Bio_ClinicalBERT`, or supply its six query embeddings as a `[6, d]` NumPy array through `--query_embedding_path`. Model access is managed through the model providers.
 
-### Cohorts and evaluation units
-
-| Cohort | Role | Patients | H&E-IHC pairs |
-|---|---|---:|---:|
-| GDPH | Development and internal evaluation | 263 | 337 |
-| FAHZU | External evaluation | 100 | 101 |
-| Total | | 363 | 438 |
-
-| Evaluation subset | Patients | H&E slides | IHC slides | Pairs |
-|---|---:|---:|---:|---:|
-| GDPH internal test | 80 | 96 | 80 | 96 |
-| FAHZU external test | 100 | 101 | 101 | 101 |
-
-Multi-stain prediction uses image pairs. Single-stain evaluation uses distinct WSIs. Source WSIs and clinical annotations are governed by institutional data-access and ethics requirements. Training accepts locally prepared, de-identified data in the format above.
-
 ## Training
 
-The alignment mixture is selected by GDPH validation AUC. The following command runs a configurable candidate grid, selects its best validation result, and trains the final model with the selected mixture:
+Select the alignment mixture using validation AUC on your development data. The following command runs a configurable candidate grid, selects its best validation result, and trains the final model with the selected mixture:
 
 ```bash
 python select_alignment_lambda.py \
   --project_name cohort1 \
-  --external_project_name cohort2 \
+  --external_project_name "" \
   --base_path ./data/patches \
   --train_split_csv ./data/patches/cohort1/train_split.csv \
   --test_split_csv ./data/patches/cohort1/test_split.csv \
@@ -94,14 +87,14 @@ python select_alignment_lambda.py \
   --device cuda:0
 ```
 
-The grid is configurable with `--lambdas`. Candidate runs train and select checkpoints on the development subsets. The final run evaluates the internal and external cohorts. Outputs include `alignment_lambda_grid.csv`, `selected_alignment_lambda.json`, and `final_selected_model/`.
+The grid is configurable with `--lambdas`, and `--val_size` sets the validation fraction of the development pool. Candidate runs train and select checkpoints on the development subsets. The final run evaluates the held-out set. For an additional independent cohort, prepare a second dataset directory and set `--external_project_name` to its name, such as `cohort2`. Outputs include `alignment_lambda_grid.csv`, `selected_alignment_lambda.json`, and `final_selected_model/`.
 
 To train directly with a selected mixture, assign that value to `ALIGNMENT_LAMBDA` and run:
 
 ```bash
 python train_vgms.py \
   --project_name cohort1 \
-  --external_project_name cohort2 \
+  --external_project_name "" \
   --base_path ./data/patches \
   --train_split_csv ./data/patches/cohort1/train_split.csv \
   --test_split_csv ./data/patches/cohort1/test_split.csv \
@@ -122,7 +115,7 @@ python train_vgms.py \
 
 The default seed is 42. The image encoder supplies frozen features and the text encoder supplies frozen embeddings. Visual/query projections, cross-attention parameters, and the classifier are optimized. Checkpoint selection maximizes validation AUC with patience 10.
 
-### Configuration
+### Default configuration
 
 | Setting | Value |
 |---|---|
