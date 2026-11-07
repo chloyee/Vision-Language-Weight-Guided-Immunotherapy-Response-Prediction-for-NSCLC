@@ -16,9 +16,9 @@ python -m pip install torch==2.1.0 torchvision==0.16.0 --index-url https://downl
 python -m pip install -r requirements.txt
 ```
 
-## Training on your own data
+## Data preparation
 
-The study datasets are not publicly available. VGMS supports training on your own paired H&E and IHC data using the input format below. Dataset sizes and partition proportions can be chosen for your study. Keep all slides and image pairs from each patient in the same partition.
+Prepare paired H&E and IHC inputs in the format below. Keep all slides and image pairs from each patient in the same partition.
 
 ### Input format
 
