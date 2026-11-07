@@ -1,5 +1,5 @@
 """
-VGMS paper-protocol training for paired H&E and PD-L1 IHC WSIs.
+VGMS training for paired H&E and PD-L1 IHC WSIs.
 
 This script expects de-identified cohort folders where CHIEF patch features
 have already been extracted:
@@ -398,7 +398,7 @@ def estimate_stain_vectors_macenko(img, alpha=1.0, beta=0.15, stain_type="he"):
     v2 = v2 / (np.linalg.norm(v2) + 1e-8)
 
     # Put hematoxylin-like vector first for HE. For IHC we keep the convention
-    # used by the user's DAB unit: channel 0 is DAB-like, channel 1 is H-like.
+    # used by the IHC channel ordering: channel 0 is DAB-like, channel 1 is H-like.
     h_like_first = v1[2] >= v1[0]
     if stain_type in ["ihc", "h-dab", "hdab"]:
         if h_like_first:
@@ -567,7 +567,7 @@ def compute_ihc_morphology(ihc_path, dab_path, mode="macenko", map_size=32, scal
             image = load_rgb(ihc_path)
             if mode == "macenko":
                 concentrations_norm, _, _ = color_deconvolution_macenko(image, stain_type="ihc")
-                # User's IHC DAB unit uses 255 - concentrations_norm[:, :, 0].
+                # The IHC DAB channel uses 255 - concentrations_norm[:, :, 0].
                 dab_channel = 255.0 - concentrations_norm[:, :, 0].astype(np.float32)
                 h_channel = 255.0 - concentrations_norm[:, :, 1].astype(np.float32)
             else:
@@ -582,7 +582,7 @@ def compute_ihc_morphology(ihc_path, dab_path, mode="macenko", map_size=32, scal
     if dab_path and os.path.exists(dab_path):
         try:
             dab_gray = np.array(Image.open(dab_path).convert("L"), dtype=np.float32)
-            # Precomputed user DAB channel is already higher for stronger DAB.
+            # Precomputed DAB channel is already higher for stronger DAB.
             dab_mean = float(np.clip(dab_gray / 255.0, 0.0, 1.0).mean())
         except Exception:
             pass
@@ -915,10 +915,16 @@ def row_has_required_features(row, args, project_name):
 def load_case_metadata(project_name, base_path, expected_cases=0, args=None):
     metadata_path = find_metadata_path(project_name, base_path)
     df = pd.read_csv(metadata_path)
-    required = {"pair_case_name", "label"}
+    required = {"case_id", "pair_case_name", "label"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Metadata missing columns: {missing}")
+    if df[list(required)].isna().any().any():
+        raise ValueError("Patient identifiers, pair identifiers and labels must be present")
+    if not df["label"].isin([0, 1]).all():
+        raise ValueError("Labels must be 0 (non-pCR) or 1 (pCR)")
+    if df.groupby("case_id")["label"].nunique().gt(1).any():
+        raise ValueError("Each patient must have one response label")
     df = enrich_metadata_columns(df, project_name)
     df = deduplicate_case_metadata(df, project_name)
 
@@ -1136,7 +1142,7 @@ class CaseMILDataset(Dataset):
             "he_candidate_tile_names": list(case_obj["tile_names"]),
             "he_patch_paths": list(case_obj["he_patch_paths"]),
             "ihc_patch_paths": [case_obj["ihc_patch_paths"][i] for i in keep_ihc],
-            # The paper samples at most 1,024 IHC anchors while retaining all
+            # Sample at most 1,024 IHC anchors while retaining all
             # H&E patches from the case as matching candidates.
             "he_features": case_obj["he_features"],
             "ihc_features": case_obj["ihc_features"][keep_ihc_t],
@@ -1532,7 +1538,7 @@ class VGMS(nn.Module):
         self.query_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.visual_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
         # Used only by the no-query ablation. The full VGMS path below remains
-        # the six-query cross-attention described in the paper.
+        # six-query cross-attention.
         self.mil_attention_v = nn.Linear(hidden_dim, hidden_dim)
         self.mil_attention_u = nn.Linear(hidden_dim, hidden_dim)
         self.mil_attention_w = nn.Linear(hidden_dim, 1, bias=False)
@@ -1815,7 +1821,7 @@ def postprocess_probability_from_logit(logit_value, args):
     if mode == "temperature":
         temperature = max(float(getattr(args, "prob_temperature", 4.0)), 1e-6)
         scaled_logit = logit_value / temperature
-        logit_clip = float(getattr(args, "prob_logit_clip", 8.0))
+        logit_clip = float(getattr(args, "prob_logit_clip", 0.0))
         if logit_clip > 0:
             scaled_logit = max(min(scaled_logit, logit_clip), -logit_clip)
         prob = sigmoid_float(scaled_logit)
@@ -2260,6 +2266,8 @@ def get_model_selection_loader(val_loader, val_df):
             "Set --val_size to a value greater than zero. Test cohorts are never "
             "used for early stopping or model selection."
         )
+    if val_df["label"].nunique() != 2:
+        raise ValueError("Validation AUC requires both response classes")
     return "val", val_loader, len(val_df)
 
 
@@ -2355,8 +2363,9 @@ def train(args):
         train_metrics = compute_metrics(
             labels=[row["true_label"] for row in train_rows],
             probs=[row["predict_probability"] for row in train_rows],
-            n_bootstraps=100,
+            n_bootstraps=0,
             seed=args.seed,
+            groups=[row["case_id"] for row in train_rows],
         )
         print(f"[INFO] Train loss={train_loss:.4f}, Train AUC={train_metrics['AUC']}")
 
@@ -2369,7 +2378,9 @@ def train(args):
             save_intermediates=False,
         )
         selection_auc = selection_metrics.get("AUC", float("nan"))
-        score = selection_auc if not np.isnan(selection_auc) else selection_metrics.get("Accuracy", 0.0)
+        if not np.isfinite(selection_auc):
+            raise ValueError("Validation AUC must be finite for checkpoint selection")
+        score = selection_auc
         print(
             f"[INFO] Model-selection split={selection_split_name}, "
             f"AUC={selection_auc}, score={score:.4f}"
@@ -2575,7 +2586,7 @@ def parse_args():
         type=str,
         default="macenko",
         choices=["fast_gray", "macenko", "none"],
-        help="fast_gray is much faster; macenko matches the stain-separation idea but is CPU-heavy.",
+        help="Stain decomposition: macenko concentration maps, fast_gray proxies, or none.",
     )
 
     parser.add_argument("--stain_scalar_mode", choices=["train_standardized", "legacy_patch_mean"],
@@ -2600,7 +2611,7 @@ def parse_args():
         "--val_size",
         type=float,
         default=2.0 / 7.0,
-        help="Validation fraction within the 70% development pool; 2/7 yields the paper's 5:2:3 split.",
+        help="Validation fraction within the 70% development pool; 2/7 yields a 5:2:3 split.",
     )
     parser.add_argument("--train_on_all", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -2611,7 +2622,7 @@ def parse_args():
         type=str,
         default="temperature",
         choices=["none", "temperature", "shrink", "clip"],
-        help="Post-process saved final prediction probabilities only; the paper protocol uses temperature scaling with T=4. Training and model selection stay unchanged.",
+        help="Post-process saved final prediction probabilities only; temperature scaling uses T=4. Training and model selection stay unchanged.",
     )
     parser.add_argument(
         "--prob_temperature",
@@ -2640,7 +2651,7 @@ def parse_args():
     parser.add_argument(
         "--allow_missing_morphology",
         action="store_true",
-        help="Allow missing patch images by substituting zero morphology maps; not paper-faithful.",
+        help="Allow missing patch images by substituting zero morphology maps; available with legacy_patch_mean scalars.",
     )
     parser.add_argument("--prebuild_cache", action="store_true")
     parser.add_argument("--cache_only", action="store_true")
